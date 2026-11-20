@@ -1,0 +1,32 @@
+name: flare-donor
+services:
+  runner:
+    image: ${RUNNER_IMAGE:?build the local image first}
+    pull_policy: never
+    command: ["/stage1", "runner"]
+    restart: unless-stopped
+    network_mode: none
+    pid: host
+    read_only: true
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    cpus: 1
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 48
+    devices: ["flare.local/gpu=0"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /sys/fs/cgroup:/host-cgroup:ro
+      - /etc/cdi/flare-stage1.json:/profile/cdi.json:ro
+      - control:/control
+      - state:/state
+    logging:
+      driver: local
+      options:
+        max-size: 1m
+        max-file: "2"
+volumes:
+  control:
+  state:

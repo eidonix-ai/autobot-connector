@@ -23,6 +23,7 @@ type leaseRequest struct {
 	Lease    string    `json:"lease"`
 	Deadline time.Time `json:"deadline"`
 	Salvage  []string  `json:"salvage,omitempty"`
+	Bundle   bool      `json:"bundle,omitempty"`
 }
 
 type commandFact struct {
@@ -41,6 +42,7 @@ type lease struct {
 	SalvageTar      []byte        `json:"salvage_tar,omitempty"`
 	SalvageError    string        `json:"salvage_error,omitempty"`
 	pending         string
+	loading, loaded bool
 }
 
 type state struct {

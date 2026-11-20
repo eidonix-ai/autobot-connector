@@ -22,7 +22,7 @@ const (
 )
 
 var tmpfs = map[string]string{
-	"/work":    "rw,exec,nosuid,nodev,size=16m,nr_inodes=128,mode=0700,uid=1000,gid=1000",
+	"/work":    "rw,exec,nosuid,nodev,size=128m,nr_inodes=8192,mode=0700,uid=1000,gid=1000",
 	"/tmp":     "rw,noexec,nosuid,nodev,size=8m,nr_inodes=128,mode=0700,uid=1000,gid=1000",
 	"/dev/shm": "rw,noexec,nosuid,nodev,size=8m,nr_inodes=128,mode=0700,uid=1000,gid=1000",
 }
@@ -142,11 +142,11 @@ func checkMounts(raw, id string, spec cdiSpec) error {
 		}
 		delete(want, path)
 		if _, ok := tmpfs[path]; ok {
-			size := "size=8192k"
+			size, inodes := "size=8192k", "nr_inodes=128"
 			if path == "/work" {
-				size = "size=16384k"
+				size, inodes = "size=131072k", "nr_inodes=8192"
 			}
-			for _, value := range []string{size, "nr_inodes=128", "uid=1000", "gid=1000", "mode=700", "nosuid", "nodev"} {
+			for _, value := range []string{size, inodes, "uid=1000", "gid=1000", "mode=700", "nosuid", "nodev"} {
 				if !got.check(value) {
 					return fmt.Errorf("%s missing mount option %s", path, value)
 				}

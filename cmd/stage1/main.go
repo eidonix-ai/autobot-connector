@@ -50,6 +50,21 @@ func decode(w http.ResponseWriter, req *http.Request, v any) bool {
 
 func (r *runner) api() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /readiness", func(w http.ResponseWriter, req *http.Request) {
+		r.mu.Lock()
+		status := struct{ Status, Active, Last, End string }{Status: "ready"}
+		if r.dirty || r.reason != "" {
+			status.Status = "unhealthy"
+		}
+		if r.Active != nil {
+			status.Status, status.Active = "running", r.Active.Lease
+		}
+		if r.Last != nil {
+			status.Last, status.End = r.Last.Lease, r.Last.End
+		}
+		r.mu.Unlock()
+		json.NewEncoder(w).Encode(status)
+	})
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, req *http.Request) {
 		r.mu.Lock()
 		status := "ready"
@@ -112,6 +127,7 @@ func (r *runner) api() http.Handler {
 		}
 		w.WriteHeader(http.StatusAccepted)
 	})
+	mux.HandleFunc("POST /load", r.load)
 	mux.HandleFunc("POST /exec", r.command)
 	return mux
 }
@@ -127,7 +143,7 @@ func (r *runner) command(w http.ResponseWriter, req *http.Request) {
 	}
 	r.mu.Lock()
 	j := r.Active
-	if r.dirty || j == nil || j.Lease != in.Lease || j.End != "" || j.pending != "" || !time.Now().Before(j.Deadline) {
+	if r.dirty || j == nil || j.Lease != in.Lease || j.End != "" || j.pending != "" || (j.Bundle && !j.loaded) || !time.Now().Before(j.Deadline) {
 		r.mu.Unlock()
 		http.Error(w, "lease cannot accept a command", http.StatusConflict)
 		return
@@ -256,7 +272,7 @@ func fixture(args []string) (int, error) {
 		if err != nil {
 			return 1, err
 		}
-		input = leaseRequest{args[2], time.Now().Add(duration), args[4:]}
+		input = leaseRequest{Lease: args[2], Deadline: time.Now().Add(duration), Salvage: args[4:]}
 	case "exec":
 		if len(args) < 4 {
 			return 1, errors.New("exec requires a lease and argv")
@@ -326,6 +342,8 @@ func main() {
 		err = command(args)
 	case "profile":
 		err = profile()
+	case "load":
+		err = load(args, os.Stdin)
 	case "export":
 		err = export(args)
 	case "probe":

@@ -256,6 +256,10 @@ func probe(args []string) error {
 }
 
 func fill(dir, kind string) error {
+	var capacity syscall.Statfs_t
+	if err := syscall.Statfs(dir, &capacity); err != nil {
+		return err
+	}
 	var written int
 	var err error
 	switch kind {
@@ -268,13 +272,13 @@ func fill(dir, kind string) error {
 		defer os.Remove(file.Name())
 		defer file.Close()
 		block := make([]byte, 1<<20)
-		for written <= 16<<20 && err == nil {
+		for written <= int(capacity.Blocks)*int(capacity.Bsize) && err == nil {
 			var n int
 			n, err = file.Write(block)
 			written += n
 		}
 	case "inodes":
-		for written <= 129 {
+		for written <= int(capacity.Files) {
 			name := filepath.Join(dir, strconv.Itoa(written))
 			var file *os.File
 			file, err = os.OpenFile(name, os.O_CREATE|os.O_EXCL, 0600)

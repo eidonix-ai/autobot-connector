@@ -41,13 +41,17 @@ if len(sys.argv) > 1 and sys.argv[1] == "listen":
     sys.exit()
 
 REBOOT = Path("reboot-state.log")
-MODE = sys.argv[-1] if sys.argv[-1] in {"reboot-before", "reboot-after"} else "checks"
+MODE = sys.argv[-1] if sys.argv[-1] in {"reboot-before", "reboot-after", "stage2"} else "checks"
 if MODE == "reboot-after":
     reboot = json.loads(REBOOT.read_text())
     BIN, SOCKET, RUNNER, WORK = reboot["args"]
 else:
     BIN, SOCKET, RUNNER, WORK = sys.argv[1:5]
-FIXTURE = [BIN, "fixture", SOCKET]
+DIRECT = [BIN, "fixture", SOCKET]
+FIXTURE = DIRECT
+if MODE == "stage2":
+    DRIVER, HUB_SOCKET, DONOR = sys.argv[5:8]
+    FIXTURE = [DRIVER, HUB_SOCKET, DONOR]
 LABEL = "org.flare.donor.lease"
 MARKERS = "for d in /work /tmp /dev/shm; do printf stage1 > \"$d/marker\"; done; echo marker-streamed"
 children = []
@@ -96,11 +100,17 @@ def live_line(p):
 
 
 def cli(*args, **kwargs):
-    return run(*FIXTURE, *args, **kwargs)
+    p = run(*FIXTURE, *args, **kwargs)
+    if MODE == "stage2" and args[0] == "run" and p.returncode == 0:
+        lease = p.stdout.strip()
+        active = status()["active"]
+        assert active["lease"] == lease
+        p.stdout = json.dumps(active)
+    return p
 
 
 def status():
-    p = cli("status", expected=None, quiet=True, timeout=6)
+    p = run(*DIRECT, "status", expected=None, quiet=True, timeout=6)
     return json.loads(p.stdout) if p.returncode == 0 else {}
 
 
@@ -301,11 +311,11 @@ def oom(j):
 
 def limits():
     j = start("limits")
-    for mount, size in [("/work", 16 << 20), ("/tmp", 8 << 20), ("/dev/shm", 8 << 20)]:
+    for mount, size in [("/work", 128 << 20), ("/tmp", 8 << 20), ("/dev/shm", 8 << 20)]:
         p = job(j, "/stage1", "probe", "fill", mount, "bytes")
         assert p.stdout.strip().endswith(f"ENOSPC after {size}"), p.stdout
     p = job(j, "/stage1", "probe", "fill", "/work", "inodes")
-    assert p.stdout.strip().endswith("ENOSPC after 127"), p.stdout
+    assert p.stdout.strip().endswith("ENOSPC after 8191"), p.stdout
     cg = group(j["container"])
     before = counters(cg / "pids.events")["max"]
     p = job(j, "/stage1", "probe", "fork")
@@ -428,7 +438,7 @@ def teardown():
                 stop_child(p, signal.SIGKILL)
             deadline = datetime.fromisoformat(j["deadline"]).timestamp()
             deadline_mono = time.monotonic() + deadline - time.time()
-            result = ready(name, end, seconds=30, since=deadline_mono)["last"]
+            result = ready(j["lease"], end, seconds=30, since=deadline_mono)["last"]
             absent(j, old)
         else:
             since = time.monotonic()
@@ -439,7 +449,7 @@ def teardown():
                 run("systemctl", "restart", "docker", timeout=110)
                 wait_for(lambda: run("docker", "info", quiet=True, expected=None, timeout=6).returncode == 0, 15, "daemon restarted")
                 since, limit = time.monotonic(), 120
-            result = ready(name, end, seconds=limit, since=since)["last"]
+            result = ready(j["lease"], end, seconds=limit, since=since)["last"]
             absent(j, old)
         if end == "lost":
             lost(j, result)
@@ -461,7 +471,7 @@ def refusal():
         f.write(leftover + "\n")
     try:
         p = cli("run", "refused-leftover", "15s", expected=1)
-        assert "leftover labelled container" in p.stderr
+        assert MODE == "stage2" or "leftover labelled container" in p.stderr
         assert "leftover labelled container" in status()["reason"]
     finally:
         run("docker", "rm", leftover)
@@ -473,7 +483,8 @@ def refusal():
         assert live_line(p) == "touched 3072 MiB"
         print(f"memory refusal: baseline={before} KiB held={mem_available()} KiB")
         denied = cli("run", "refused-memory", "15s", expected=1)
-        assert "below recovery floor" in denied.stderr and "below recovery floor" in status()["reason"]
+        assert MODE == "stage2" or "below recovery floor" in denied.stderr
+        assert "below recovery floor" in status()["reason"]
     finally:
         stop_child(p)
     ready()

@@ -27,6 +27,38 @@ services:
       options:
         max-size: 1m
         max-file: "2"
+  link:
+    profiles: [link]
+    image: ${LINK_IMAGE:-donor-link}
+    pull_policy: never
+    command: ["/link", "run"]
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    cpus: 1
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 48
+    devices: ["flare.local/gpu=0"]
+    environment:
+      - DONOR_HUB
+      - DONOR_TEST_HUB
+      - DONOR_MAX_TEMPERATURE
+      - WORK_IMAGE
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=320m,nr_inodes=20000,mode=0700,uid=1000,gid=1000
+    volumes:
+      - control:/control:ro
+      - link_state:/link-state
+      - ${HUB_CERTIFICATE:-./hub.pem}:/hub/certificate.pem:ro
+    logging:
+      driver: local
+      options:
+        max-size: 1m
+        max-file: "2"
 volumes:
+  link_state:
   control:
   state:

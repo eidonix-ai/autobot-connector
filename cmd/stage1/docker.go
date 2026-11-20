@@ -117,10 +117,18 @@ func (d engine) remove(id string) error {
 }
 
 func (d engine) newExec(id string, argv []string) (string, error) {
+	return d.createExec(id, argv, false)
+}
+
+func (d engine) newExecWithInput(id string, argv []string) (string, error) {
+	return d.createExec(id, argv, true)
+}
+
+func (d engine) createExec(id string, argv []string, input bool) (string, error) {
 	var result struct{ ID string }
 	err := d.call("POST", "/containers/"+id+"/exec", map[string]any{
 		"Cmd": argv, "User": "1000:1000", "WorkingDir": "/work",
-		"AttachStdout": true, "AttachStderr": true,
+		"AttachStdout": true, "AttachStderr": true, "AttachStdin": input,
 	}, &result)
 	return result.ID, err
 }

@@ -3,7 +3,8 @@
 Run these commands on the DGX Spark test machine from a copy of the source tree. Place the
 official Linux arm64 Go 1.26.5 archive beside `go.mod` as `go.tgz`. The script verifies its
 checksum and builds both images natively from local files. It uses the installed CUDA 13.0
-compiler to build the SM121 kernel. Images are imported locally and selected by their immutable
+compiler to build the SM121 kernel. The Go module can be supplied from a local download cache
+as described in [Stage 2](STAGE2.md). Images are imported locally and selected by their immutable
 image IDs. [Go release archive](https://go.dev/dl/#go1.26.5)
 
 ```sh
@@ -15,7 +16,7 @@ Docker daemon, an idle GPU and passwordless sudo for the host checks. It restart
 cleans up the recorded container, image and volume IDs on exit.
 
 The prototype job has one CPU of quota, 512 MiB of memory with zero swap, 48 tasks, and tmpfs
-limits of 16 MiB for `/work` and 8 MiB each for `/tmp` and `/dev/shm`. Each has 128 inodes.
+limits of 128 MiB and 8192 inodes for `/work`, and 8 MiB and 128 inodes each for `/tmp` and `/dev/shm`.
 The runner checks the live mounts, devices, security profiles and cgroup limits before returning
 a lease to the fixture. The local CDI spec pins four CUDA device nodes and five read-only
 driver mounts. Docker's named standard system mounts retain their default flags. The trusted

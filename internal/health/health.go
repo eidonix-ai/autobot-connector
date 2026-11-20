@@ -47,7 +47,7 @@ type Tracker struct {
 	MaxTemperature                int
 	temperature, throttle, memory rule
 	fan, errors                   bool
-	previous                      []wire.GPU
+	previous                      map[string]wire.GPU
 	work                          time.Duration
 	workingSince, idleSince       time.Time
 	duty                          bool
@@ -73,24 +73,32 @@ func (t *Tracker) Read(sample wire.Health, working, clear bool) wire.Health {
 	if clear {
 		t.fan, t.errors = false, false
 	}
-	memoryAvailable := sample.TotalKiB > 0 && sample.AvailableKiB >= 0 && sample.AvailableKiB <= sample.TotalKiB
-	t.memory.update(now,
-		memoryAvailable && sample.AvailableKiB*10 < sample.TotalKiB,
-		memoryAvailable && sample.AvailableKiB*5 > sample.TotalKiB)
-	if !memoryAvailable {
-		reasons = append(reasons, "host memory reading unavailable")
-	}
-	if t.memory.on {
-		reasons = append(reasons, "host memory")
+	unified := len(sample.GPUs) == 1 && sample.GPUs[0].Name == "NVIDIA GB10" && sample.GPUs[0].SM == "12.1"
+	if unified {
+		memoryAvailable := sample.TotalKiB > 0 && sample.AvailableKiB >= 0 && sample.AvailableKiB <= sample.TotalKiB
+		t.memory.update(now,
+			memoryAvailable && sample.AvailableKiB*10 < sample.TotalKiB,
+			memoryAvailable && sample.AvailableKiB*5 > sample.TotalKiB)
+		if !memoryAvailable {
+			reasons = append(reasons, "host memory reading unavailable")
+		}
+		if t.memory.on {
+			reasons = append(reasons, "host memory")
+		}
 	}
 
-	valid := len(sample.GPUs) == 1
+	valid := len(sample.GPUs) > 0 && len(sample.GPUs) <= wire.MaxGPUs
 	hot, throttled, cool := false, false, true
-	for i, gpu := range sample.GPUs {
-		// GB10 requires temperature, power draw, graphics clocks and event reasons.
-		// Power limit, memory clocks, memory capacity, fan, ECC and Xid vary by driver.
-		valid = valid && gpu.Name == "NVIDIA GB10" && gpu.SM == "12.1" &&
-			gpu.Temperature != nil && gpu.PowerMW != nil && gpu.GraphicsMHz != nil && gpu.Throttle != nil
+	current := make(map[string]wire.GPU, len(sample.GPUs))
+	for _, gpu := range sample.GPUs {
+		_, duplicate := current[gpu.UUID]
+		current[gpu.UUID] = gpu
+		common := !duplicate && gpu.Temperature != nil && gpu.PowerMW != nil && gpu.GraphicsMHz != nil && gpu.Throttle != nil
+		discrete := gpu.Name == "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition" && gpu.SM == "12.0" &&
+			gpu.UUID != "" && gpu.PowerLimitMW != nil && gpu.MemoryMHz != nil && gpu.Fan != nil &&
+			gpu.MemoryMiB != nil && gpu.MemoryUsedMiB != nil && *gpu.MemoryMiB > 0 &&
+			*gpu.MemoryUsedMiB >= 0 && *gpu.MemoryUsedMiB <= *gpu.MemoryMiB
+		valid = valid && common && (unified || discrete)
 		if gpu.Temperature != nil {
 			hot = hot || *gpu.Temperature >= t.MaxTemperature
 			cool = cool && *gpu.Temperature <= t.MaxTemperature-10
@@ -99,19 +107,21 @@ func (t *Tracker) Read(sample wire.Health, working, clear bool) wire.Health {
 		if gpu.Throttle != nil {
 			throttled = throttled || (*gpu.Throttle&ThrottleMask != 0)
 		}
+		previous := t.previous[gpu.UUID]
 		if gpu.XIDCount != nil && *gpu.XIDCount != 0 &&
-			(i >= len(t.previous) || t.previous[i].XIDCount == nil || *t.previous[i].XIDCount != *gpu.XIDCount) {
+			(previous.XIDCount == nil || *previous.XIDCount != *gpu.XIDCount) {
 			t.errors = true
 		}
-		if i < len(t.previous) && rose(t.previous[i].ECC, gpu.ECC) {
+		if rose(previous.ECC, gpu.ECC) {
 			t.errors = true
 		}
 	}
-	if len(sample.GPUs) != 0 {
-		t.previous = sample.GPUs
-	}
-	if !valid {
+	if valid {
+		t.previous = current
+	} else if unified {
 		reasons = append(reasons, "mandatory GB10 readings unavailable")
+	} else {
+		reasons = append(reasons, "mandatory GPU readings unavailable")
 	}
 	t.temperature.update(now, hot, valid && cool)
 	t.throttle.update(now, throttled, valid && !throttled)

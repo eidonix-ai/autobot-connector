@@ -20,12 +20,37 @@ import (
 	"autobot-connector/internal/wire"
 )
 
+func clearStaleSocket(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return errors.New("hub admin path is not a Unix socket")
+	}
+	c, err := net.DialTimeout("unix", path, time.Second)
+	if err == nil {
+		c.Close()
+		return errors.New("hub admin socket is already in use")
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return err
+	}
+	return os.Remove(path)
+}
+
 func serve(args []string, socket string) error {
 	if len(args) != 5 {
-		return errors.New("usage: hub serve LISTEN CERT KEY STATE_DIR WORK_IMAGE")
+		return errors.New("usage: hub serve LISTEN CERT KEY STATE_DIR WORK_IMAGE_PINS")
 	}
 	h, err := hubserver.New(args[3], args[4])
 	if err != nil {
+		return err
+	}
+	if err := clearStaleSocket(socket); err != nil {
 		return err
 	}
 	local, err := net.Listen("unix", socket)

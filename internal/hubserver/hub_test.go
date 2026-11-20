@@ -26,7 +26,7 @@ type testHub struct {
 
 func newTestHub(t *testing.T) testHub {
 	t.Helper()
-	h, err := New(t.TempDir(), image)
+	h, err := New(t.TempDir(), "arm64="+image)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestEnrollment(t *testing.T) {
 		t.Fatal(reason)
 	}
 	t.Log("code refused at one-hour expiry")
-	reloaded, err := New(h.dir, image)
+	reloaded, err := New(h.dir, "arm64="+image)
 	if err != nil || !reloaded.state.Donors[id].Revoked ||
 		!reloaded.state.Codes[keyID([]byte(secret))].IsZero() {
 		t.Fatalf("registry persistence: %v", err)
@@ -229,7 +229,7 @@ func TestConnectionFlood(t *testing.T) {
 }
 
 func TestTranscript(t *testing.T) {
-	for _, name := range []string{"valid", "tampered", "replayed", "stale", "reordered", "incomplete"} {
+	for _, name := range []string{"valid", "tampered", "replayed", "stale", "reordered", "incomplete", "runner-lost", "runner-unavailable"} {
 		t.Run(name, func(t *testing.T) {
 			h := newTestHub(t)
 			secret, err := h.code()
@@ -319,11 +319,20 @@ func TestTranscript(t *testing.T) {
 			read("finish")
 			record.Add(true, "finish", struct{}{})
 			reason := wire.Reason{Reason: "complete"}
+			if name == "runner-lost" || name == "runner-unavailable" {
+				reason.Reason = "lost"
+			}
 			record.Add(false, "ending", reason)
 			send("ending", job.id, reason)
 			read("seal")
 			record.Add(true, "seal", struct{}{})
 			facts := wire.Facts{End: "complete", RunnerEnd: "complete", Ready: true, Health: sample, Commands: []wire.CommandFact{exit.Fact}}
+			if name == "runner-lost" {
+				facts.End, facts.RunnerEnd = "lost", "lost"
+			}
+			if name == "runner-unavailable" {
+				facts = wire.Facts{End: "lost", Health: sample, SalvageError: "runner result unavailable"}
+			}
 			if name == "stale" {
 				facts.Health.At = offer.Issued.Add(-time.Minute)
 			}
@@ -337,7 +346,17 @@ func TestTranscript(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("transcript response timed out")
 			}
-			valid := name == "valid" || name == "replayed"
+			if name == "runner-unavailable" {
+				if job.result.Verified || job.result.Facts.Ready || job.result.Facts.End != "lost" || job.result.Error != "runner result unavailable" {
+					t.Fatalf("unrecovered lease produced %+v", job.result)
+				}
+				if _, err := server.begin(wire.Manifest{}, time.Minute, wire.ScratchCap); err != nil {
+					t.Fatalf("donor could not accept another lease: %v", err)
+				}
+				read("offer")
+				return
+			}
+			valid := name == "valid" || name == "replayed" || name == "runner-lost"
 			if job.result.Verified != valid || (!valid && !strings.Contains(job.result.Error, "transcript refused")) {
 				t.Fatalf("unexpected transcript result: %+v", job.result)
 			}
@@ -398,4 +417,30 @@ func (h testHub) refuseTranscriptReplay(t *testing.T, socket *wire.Socket, k ed2
 		t.Fatalf("unexpected result for replay into a fresh lease: %+v", next.result)
 	}
 	t.Logf("same transcript replayed after reconnect: verified=%t, end=%s, error=%q", next.result.Verified, next.result.Facts.End, next.result.Error)
+}
+
+func TestWorkImagePinsAndAllocations(t *testing.T) {
+	other := "sha256:" + strings.Repeat("1", 64)
+	pins, err := workImages("amd64=" + image + ",arm64=" + other)
+	if err != nil || pins["amd64"] != image || pins["arm64"] != other {
+		t.Fatal(pins, err)
+	}
+	for _, bad := range []string{"", image, "ppc64le=" + image, "amd64=" + image + ",amd64=" + other} {
+		if _, err := workImages(bad); err == nil {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+	free := 4
+	s := session{status: wire.Status{FreeGPUs: &free, Health: wire.Health{
+		GPUs: []wire.GPU{{UUID: "a"}, {UUID: "b"}, {UUID: "c"}, {UUID: "d"}}}},
+		active: map[string]*lease{"first": {devices: []string{"a", "b"}}}}
+	l := &lease{offer: wire.Offer{Manifest: wire.Manifest{GPUs: 2}}}
+	for _, bad := range [][]string{{"c"}, {"c", "c"}, {"b", "c"}, {"c", "other"}} {
+		if s.validDevices(l, bad) {
+			t.Fatalf("accepted allocation %v", bad)
+		}
+	}
+	if !s.validDevices(l, []string{"c", "d"}) {
+		t.Fatal("refused two free GPUs")
+	}
 }

@@ -22,14 +22,24 @@ type localState struct {
 	mu      sync.Mutex
 	tracker health.Tracker
 	sample  wire.Health
-	job     *job
+	jobs    map[string]*job
 	paused  bool
 }
 
-func (l *Link) active() *job {
+func (l *Link) active(id string) *job {
 	l.state.mu.Lock()
 	defer l.state.mu.Unlock()
-	return l.state.job
+	return l.state.jobs[id]
+}
+
+func (l *Link) activeJobs() []*job {
+	l.state.mu.Lock()
+	defer l.state.mu.Unlock()
+	out := make([]*job, 0, len(l.state.jobs))
+	for _, j := range l.state.jobs {
+		out = append(out, j)
+	}
+	return out
 }
 
 func (l *Link) latest() wire.Health {
@@ -40,15 +50,31 @@ func (l *Link) latest() wire.Health {
 
 func (l *Link) status(ctx context.Context) wire.Status {
 	l.state.mu.Lock()
-	sample, paused, active := l.state.sample, l.state.paused, l.state.job != nil
+	sample, paused := l.state.sample, l.state.paused
+	pending := 0
+	for _, j := range l.state.jobs {
+		if !j.working.Load() {
+			pending += wire.GPUCount(j.offer.Manifest.GPUs)
+		}
+	}
 	l.state.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
 	defer cancel()
-	var r struct{ Status string }
+	var r runnerReadiness
 	err := l.runner.json(ctx, "GET", "/readiness", nil, &r)
-	return wire.Status{Health: sample, Paused: paused, Ready: !active && !paused && !sample.At.IsZero() &&
-		len(sample.Reasons) == 0 && err == nil && r.Status == "ready", Arch: runtime.GOARCH, CPUs: runtime.NumCPU(),
-		CPUQuota: 100000, Memory: 512 << 20, PIDs: 48, Image: l.config.Image, Scratch: wire.ScratchCap}
+	free := 0
+	if err == nil && r.WorkProfile != nil && *r.WorkProfile == l.workProfile {
+		if r.FreeGPUs != nil {
+			free = max(0, *r.FreeGPUs-pending)
+		} else if r.Status == "ready" && pending == 0 {
+			free = 1
+		}
+	}
+	free = min(free, len(sample.GPUs))
+	limits, _ := wire.WorkLimits(l.workProfile)
+	return wire.Status{Health: sample, Paused: paused, Ready: free > 0 && !paused && !sample.At.IsZero() &&
+		len(sample.Reasons) == 0, Arch: runtime.GOARCH, CPUs: runtime.NumCPU(), FreeGPUs: &free,
+		CPUQuota: limits.CPU * 100000, Memory: limits.Memory, PIDs: limits.PIDs, Image: l.config.Image, Scratch: limits.Scratch}
 }
 
 func (l *Link) restoreHealth() error {
@@ -81,23 +107,23 @@ func (l *Link) checkpoint(s health.Checkpoint) error {
 }
 
 func (l *Link) monitor(ctx context.Context) {
-	gpus := make(chan wire.GPU, 1)
+	gpus := make(chan []wire.GPU, 1)
 	go readGPU(ctx, l.config.NVML, gpus)
 	tick := time.NewTicker(health.Interval)
 	defer tick.Stop()
-	var gpu wire.GPU
+	var gpusSample []wire.GPU
 	var gpuAt time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case gpu = <-gpus:
+		case gpusSample = <-gpus:
 			gpuAt = time.Now()
 		case now := <-tick.C:
 			sample := wire.Health{At: now.UTC()}
 			sample.TotalKiB, sample.AvailableKiB, _ = health.HostMemory()
 			if now.Sub(gpuAt) <= 3*time.Second {
-				sample.GPUs = []wire.GPU{gpu}
+				sample.GPUs = gpusSample
 			}
 			_, pauseErr := os.Stat(filepath.Join(l.config.State, "pause"))
 			clear := os.Remove(filepath.Join(l.config.State, "clear")) == nil
@@ -108,10 +134,15 @@ func (l *Link) monitor(ctx context.Context) {
 
 func (l *Link) applySample(sample wire.Health, paused, clear bool) {
 	l.state.mu.Lock()
-	j := l.state.job
+	jobs := make([]*job, 0, len(l.state.jobs))
+	working := false
+	for _, j := range l.state.jobs {
+		jobs = append(jobs, j)
+		working = working || j.working.Load()
+	}
 	tracker := &l.state.tracker
 	before := tracker.Checkpoint()
-	sample = tracker.Read(sample, j != nil && j.working.Load(), clear)
+	sample = tracker.Read(sample, working, clear)
 	if after := tracker.Checkpoint(); after != before {
 		if err := l.checkpoint(after); err != nil {
 			sample.Reasons = append(sample.Reasons, "health checkpoint failed")
@@ -120,12 +151,14 @@ func (l *Link) applySample(sample wire.Health, paused, clear bool) {
 	}
 	l.state.sample, l.state.paused = sample, paused
 	l.state.mu.Unlock()
-	if j != nil && len(sample.Reasons) > 0 {
-		j.interrupt("health", sample)
+	if len(sample.Reasons) > 0 {
+		for _, j := range jobs {
+			j.interrupt("health", sample)
+		}
 	}
 }
 
-func readGPU(ctx context.Context, path string, out chan<- wire.GPU) {
+func readGPU(ctx context.Context, path string, out chan<- []wire.GPU) {
 	for ctx.Err() == nil {
 		if err := sampleGPU(ctx, path, out); err != nil && ctx.Err() == nil {
 			log.Printf("NVML sample: %q", err)
@@ -138,7 +171,7 @@ func readGPU(ctx context.Context, path string, out chan<- wire.GPU) {
 	}
 }
 
-func sampleGPU(ctx context.Context, path string, out chan<- wire.GPU) error {
+func sampleGPU(ctx context.Context, path string, out chan<- []wire.GPU) error {
 	c := exec.CommandContext(ctx, path)
 	stdout, err := c.StdoutPipe()
 	if err != nil {
@@ -150,13 +183,13 @@ func sampleGPU(ctx context.Context, path string, out chan<- wire.GPU) error {
 	r := bufio.NewScanner(stdout)
 	r.Buffer(make([]byte, 4096), 4096)
 	for r.Scan() {
-		var gpu wire.GPU
-		if err := wire.Strict(r.Bytes(), &gpu); err != nil {
+		var gpus []wire.GPU
+		if err := wire.Strict(r.Bytes(), &gpus); err != nil {
 			c.Process.Kill()
 			return errors.Join(err, c.Wait())
 		}
 		select {
-		case out <- gpu:
+		case out <- gpus:
 		case <-ctx.Done():
 			return c.Wait()
 		}

@@ -47,6 +47,7 @@ if MODE == "reboot-after":
     BIN, SOCKET, RUNNER, WORK = reboot["args"]
 else:
     BIN, SOCKET, RUNNER, WORK = sys.argv[1:5]
+UNIFIED = os.uname().machine == "aarch64"
 DIRECT = [BIN, "fixture", SOCKET]
 FIXTURE = DIRECT
 if MODE == "stage2":
@@ -227,7 +228,7 @@ def profile():
     assert h["CapDrop"] == ["ALL"] and h["SecurityOpt"] == ["no-new-privileges"]
     assert h["PidMode"] != "host" and h["IpcMode"] != "host"
     devices = h["DeviceRequests"]
-    assert len(devices) == 1 and devices[0]["Driver"] == "cdi" and devices[0]["DeviceIDs"] == ["flare.local/gpu=0"]
+    assert len(devices) == 1 and devices[0]["Driver"] == "cdi" and devices[0]["DeviceIDs"] == ["flare.local/gpu=" + j["devices"][0]]
     assert h["RestartPolicy"]["Name"] in ("", "no") and not h["Binds"] and not data["Config"]["Volumes"]
     assert h["Memory"] == h["MemorySwap"] == 536870912
     assert h["CpuQuota"] == h["CpuPeriod"] == 100000 and h["PidsLimit"] == 48
@@ -352,6 +353,11 @@ def mem_available():
     raise AssertionError("MemAvailable missing")
 
 
+def video_memory():
+    out = run("nvidia-smi", "--query-gpu=uuid,memory.used", "--format=csv,noheader,nounits").stdout
+    return {uuid: int(used) for uuid, used in (row.split(", ") for row in out.splitlines())}
+
+
 def gpu():
     run("nvidia-smi", "--query-compute-apps=pid", "--format=csv")
     assert gpu_pids() == set()
@@ -359,8 +365,11 @@ def gpu():
     cg = group(j["container"])
     current = cg / "memory.current"
     before = mem_available(), int(current.read_text())
+    device = j["devices"][0]
+    vram_before = None if UNIFIED else video_memory()
     p = spawn(*FIXTURE, "exec", j["lease"], "/cuda")
-    assert live_line(p).startswith("SM121 uid=1000 "), "CUDA probe failed"
+    sm = 121 if UNIFIED else 120
+    assert live_line(p).startswith(f"SM{sm} uid=1000 "), "CUDA probe failed"
     old = snapshot(j["container"])
     query = run("nvidia-smi", "--query-compute-apps=pid", "--format=csv")
     visible = gpu_pids()
@@ -368,6 +377,7 @@ def gpu():
     inside = run("docker", "exec", RUNNER, "/usr/bin/nvidia-smi", "--query-compute-apps=pid", "--format=csv")
     assert all(str(pid) in inside.stdout.splitlines() for pid in visible), inside.stdout
     during = mem_available(), int(current.read_text())
+    vram_during = None if UNIFIED else video_memory()
     since = time.monotonic()
     cli("stop", j["lease"])
     record = ready(j["lease"], "cancel", since=since)["last"]
@@ -379,8 +389,16 @@ def gpu():
     print(f"GPU memory: before MemAvailable={before[0]} KiB cgroup={before[1]} B; during MemAvailable={during[0]} KiB cgroup={during[1]} B; after MemAvailable={after} KiB cgroup_at_quiesce={record['memory_at_quiesce']} B, removed afterward")
     print(f"GPU deltas: available={(during[0]-before[0])*1024} B cgroup={during[1]-before[1]} B; recovery={elapsed:.3f}s")
     assert record["commands"][-1]["exit_code"] == 137
-    assert not gpu_pids() and abs(after - before[0]) * 1024 <= 1_000_000_000 and elapsed <= 30
-    print("PASS 4 SM121 GPU and recovery")
+    assert not gpu_pids() and elapsed <= 30
+    if UNIFIED:
+        assert abs(after - before[0]) * 1024 <= 1_000_000_000
+    else:
+        vram_after = video_memory()
+        print(f"VRAM MiB by GPU UUID: before={vram_before} during={vram_during} after={vram_after}")
+        assert vram_during[device] - vram_before[device] >= 2048
+        assert all(vram_during[key] == vram_before[key] for key in vram_before if key != device)
+        assert vram_after[device] <= vram_before[device] + 64
+    print(f"PASS 4 SM{sm} GPU and recovery")
 
 
 def marker(j):
@@ -482,13 +500,18 @@ def refusal():
     try:
         assert live_line(p) == "touched 3072 MiB"
         print(f"memory refusal: baseline={before} KiB held={mem_available()} KiB")
-        denied = cli("run", "refused-memory", "15s", expected=1)
-        assert MODE == "stage2" or "below recovery floor" in denied.stderr
-        assert "below recovery floor" in status()["reason"]
+        if UNIFIED:
+            denied = cli("run", "refused-memory", "15s", expected=1)
+            assert MODE == "stage2" or "below recovery floor" in denied.stderr
+            assert "below recovery floor" in status()["reason"]
+        else:
+            j = start("host-memory-independent")
+            finish(j, snapshot(j["container"]))
     finally:
         stop_child(p)
     ready()
-    print("PASS 6 leftover container and memory refusal")
+    print("PASS 6 leftover container and unified-memory refusal" if UNIFIED
+          else "PASS 6 leftover container refusal and discrete GPU host-memory independence")
 
 
 def boot_id():
@@ -515,7 +538,9 @@ def prepare_reboot():
 
 
 def verify_reboot():
-    assert boot_id() != reboot["boot"], "host boot identifier did not change"
+    current = boot_id()
+    assert current != reboot["boot"], "host boot identifier did not change"
+    print(f"Host boot ID changed from {reboot['boot']} to {current}")
     wait_for(lambda: run("docker", "info", quiet=True, expected=None).returncode == 0, 120, "Docker available")
     started = run("systemctl", "show", "docker", "--property=ActiveEnterTimestampMonotonic", "--value")
     since = int(started.stdout) / 1_000_000

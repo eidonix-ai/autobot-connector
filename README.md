@@ -7,8 +7,9 @@ A small **runner** on the donor's machine starts a fresh, offline container for 
 destroys it afterwards; a **link** connects out to the triage hub and fetches the job's inputs from
 public sources, verified by digest. The donor's own coding agent sets it up from a brief.
 
-Status: prototype for a dedicated DGX Spark test machine.
+The connector runs on dedicated DGX Spark and four-card RTX PRO 6000 Blackwell Max-Q test machines.
 
 - [Design](docs/DESIGN.md)
-- [Stage 1 test](docs/STAGE1.md)
-- [Stage 2 test](docs/STAGE2.md)
+- [Runner acceptance](docs/STAGE1.md)
+- [Link and hub acceptance](docs/STAGE2.md)
+- [Flare donor deployment and hub migration](docs/STAGE3.md)

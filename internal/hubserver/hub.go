@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,7 +33,7 @@ type Hub struct {
 	mu                  sync.Mutex
 	state               registry
 	dir                 string
-	image               string
+	images              map[string]string
 	now                 func() time.Time
 	sessions            map[string]*session
 	byIP                map[string]int
@@ -40,9 +41,22 @@ type Hub struct {
 	attempts, connected int
 }
 
-func New(dir, image string) (*Hub, error) {
-	if !wire.Digest(image) {
-		return nil, errors.New("invalid work image pin")
+func workImages(pins string) (map[string]string, error) {
+	images := map[string]string{}
+	for _, pin := range strings.Split(pins, ",") {
+		arch, digest, ok := strings.Cut(pin, "=")
+		if !ok || (arch != "arm64" && arch != "amd64") || !wire.Digest(digest) || images[arch] != "" {
+			return nil, errors.New("invalid work image pin")
+		}
+		images[arch] = digest
+	}
+	return images, nil
+}
+
+func New(dir, pins string) (*Hub, error) {
+	images, err := workImages(pins)
+	if err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
@@ -53,7 +67,7 @@ func New(dir, image string) (*Hub, error) {
 	if err := os.MkdirAll(filepath.Join(dir, "leases"), 0700); err != nil {
 		return nil, err
 	}
-	h := &Hub{dir: dir, image: image, now: time.Now, sessions: map[string]*session{}, byIP: map[string]int{},
+	h := &Hub{dir: dir, images: images, now: time.Now, sessions: map[string]*session{}, byIP: map[string]int{},
 		state: registry{map[string]time.Time{}, map[string]donor{}}}
 	b, err := os.ReadFile(filepath.Join(dir, "registry.json"))
 	if err == nil {

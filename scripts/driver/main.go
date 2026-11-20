@@ -44,6 +44,27 @@ func run(a []string) (int, error) {
 			fmt.Println(id)
 		}
 		return 0, err
+	case "begin":
+		if len(a) != 5 {
+			return 1, errors.New("driver begin needs manifest and duration")
+		}
+		body, err := os.ReadFile(a[3])
+		if err != nil {
+			return 1, err
+		}
+		var m hub.Manifest
+		if err := json.Unmarshal(body, &m); err != nil {
+			return 1, err
+		}
+		duration, err := time.ParseDuration(a[4])
+		if err != nil {
+			return 1, err
+		}
+		id, err := c.Begin(ctx, donor, m, duration, hub.Scratch)
+		if err == nil {
+			fmt.Println(id)
+		}
+		return 0, err
 	case "exec":
 		code := 1
 		err := c.Exec(ctx, donor, lease, a[4:], func(e hub.Event) error {

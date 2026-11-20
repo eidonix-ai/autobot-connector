@@ -30,11 +30,12 @@ type Config struct {
 }
 
 type Link struct {
-	config Config
-	runner runner
-	dialer websocket.Dialer
-	key    ed25519.PrivateKey
-	state  localState
+	config      Config
+	runner      runner
+	workProfile string
+	dialer      websocket.Dialer
+	key         ed25519.PrivateKey
+	state       localState
 }
 
 type session struct {
@@ -85,6 +86,20 @@ func Run(ctx context.Context, conf Config) error {
 				return nil
 			}},
 	}}
+	readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	var readiness runnerReadiness
+	err = l.runner.json(readCtx, "GET", "/readiness", nil, &readiness)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("read runner work profile: %w", err)
+	}
+	if readiness.WorkProfile == nil {
+		return errors.New("runner did not report its work profile")
+	}
+	l.workProfile = *readiness.WorkProfile
+	if _, err := wire.WorkLimits(l.workProfile); err != nil {
+		return err
+	}
 	l.key, err = privateKey(conf.State)
 	if err != nil {
 		return err
@@ -201,8 +216,11 @@ func (l *Link) session(ctx context.Context, useCode bool) error {
 	log.Printf("connected donor %s", s.donor)
 	defer func() {
 		socket.Close()
-		if j := l.active(); j != nil {
+		jobs := l.activeJobs()
+		for _, j := range jobs {
 			j.interrupt("lost", wire.Health{})
+		}
+		for _, j := range jobs {
 			<-j.finished
 		}
 	}()
@@ -241,7 +259,7 @@ func (s session) receive() error {
 		if m.Type == "offer" {
 			var offer wire.Offer
 			if m.Lease == "" || m.Decode(&offer) != nil || !offer.Valid(time.Now()) || offer.Image != s.config.Image ||
-				s.active() != nil {
+				s.active(m.Lease) != nil {
 				return errors.New("invalid, mismatched or overlapping lease")
 			}
 			if err := s.offer(m.Lease, offer); err != nil {
@@ -249,7 +267,7 @@ func (s session) receive() error {
 			}
 			continue
 		}
-		j := s.active()
+		j := s.active(m.Lease)
 		if j == nil || j.id != m.Lease || !j.receive(m) {
 			return errors.New("unexpected, malformed or out-of-lease operation")
 		}

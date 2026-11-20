@@ -7,27 +7,44 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"autobot-connector/internal/wire"
 )
 
 const (
-	CPUQuota    = 100000
-	memoryLimit = 512 << 20
-	pidsLimit   = 48
-	salvageCap  = 1 << 20
-	cdiDevice   = "flare.local/gpu=0"
-	cdiPath     = "/profile/cdi.json"
+	powercapMask = "/sys/devices/virtual/powercap"
+	CPUPeriod    = 100000
+	salvageCap   = 1 << 20
+	cdiPath      = "/profile/cdi.json"
 )
 
-var tmpfs = map[string]string{
-	"/work":    "rw,exec,nosuid,nodev,size=128m,nr_inodes=8192,mode=0700,uid=1000,gid=1000",
-	"/tmp":     "rw,noexec,nosuid,nodev,size=8m,nr_inodes=128,mode=0700,uid=1000,gid=1000",
-	"/dev/shm": "rw,noexec,nosuid,nodev,size=8m,nr_inodes=128,mode=0700,uid=1000,gid=1000",
+var limits, limitsErr = wire.WorkLimits(workProfile)
+
+type scratchMount struct {
+	kib, inodes int
+	exec        bool
 }
 
-func (d engine) create(image, lease string) (string, error) {
+func scratchMounts() map[string]scratchMount {
+	return map[string]scratchMount{
+		"/work": {int(limits.Scratch >> 10), limits.ScratchInodes, true},
+		"/tmp":  {8192, 128, false}, "/dev/shm": {8192, 128, false},
+	}
+}
+
+func (d engine) create(image, lease string, devices []string) (string, error) {
+	tmpfs := map[string]string{}
+	for path, m := range scratchMounts() {
+		mode := "noexec"
+		if m.exec {
+			mode = "exec"
+		}
+		tmpfs[path] = fmt.Sprintf("rw,%s,nosuid,nodev,size=%dk,nr_inodes=%d,mode=0700,uid=1000,gid=1000", mode, m.kib, m.inodes)
+	}
 	var result struct{ ID string }
 	err := d.call("POST", "/containers/create", map[string]any{
 		"Image": image, "User": "1000:1000", "WorkingDir": "/work",
@@ -35,9 +52,9 @@ func (d engine) create(image, lease string) (string, error) {
 		"HostConfig": map[string]any{
 			"NetworkMode": "none", "ReadonlyRootfs": true, "Tmpfs": tmpfs,
 			"CapDrop": []string{"ALL"}, "SecurityOpt": []string{"no-new-privileges"},
-			"DeviceRequests": []map[string]any{{"Driver": "cdi", "DeviceIDs": []string{cdiDevice}}},
-			"CpuPeriod":      CPUQuota, "CpuQuota": CPUQuota, "Memory": memoryLimit, "MemorySwap": memoryLimit,
-			"PidsLimit": pidsLimit, "CgroupnsMode": "private",
+			"DeviceRequests": []map[string]any{{"Driver": "cdi", "DeviceIDs": deviceRequests(devices)}},
+			"CpuPeriod":      CPUPeriod, "CpuQuota": limits.CPU * CPUPeriod, "Memory": limits.Memory, "MemorySwap": limits.Memory,
+			"PidsLimit": limits.PIDs, "CgroupnsMode": "private",
 			"LogConfig": map[string]any{"Type": "local", "Config": map[string]string{"max-size": "1m", "max-file": "2"}},
 		},
 	}, &result)
@@ -112,6 +129,7 @@ func readCDI(pin string) (cdiSpec, error) {
 
 func checkMounts(raw, id string, spec cdiSpec) error {
 	want := make(map[string]mountRule)
+	want[powercapMask] = mountRule{"/", "tmpfs", "ro"}
 	for path, rule := range systemMounts {
 		want[path] = rule
 	}
@@ -125,6 +143,7 @@ func checkMounts(raw, id string, spec cdiSpec) error {
 		}
 		want[m.ContainerPath] = mountRule{host, "ext4", "ro"}
 	}
+	tmpfs := scratchMounts()
 	for path := range tmpfs {
 		want[path] = mountRule{"/", "tmpfs", "rw"}
 	}
@@ -140,22 +159,24 @@ func checkMounts(raw, id string, spec cdiSpec) error {
 		if !ok || rule.root != got.root || rule.kind != got.kind || !strings.HasPrefix(got.flags+",", rule.mode+",") {
 			return fmt.Errorf("unexpected mount %s %+v", path, got)
 		}
+		if path == powercapMask && (!got.check("size=4k") || !got.check("nr_inodes=1")) {
+			return fmt.Errorf("unexpected powercap mask %+v", got)
+		}
 		delete(want, path)
-		if _, ok := tmpfs[path]; ok {
-			size, inodes := "size=8192k", "nr_inodes=128"
-			if path == "/work" {
-				size, inodes = "size=131072k", "nr_inodes=8192"
-			}
-			for _, value := range []string{size, inodes, "uid=1000", "gid=1000", "mode=700", "nosuid", "nodev"} {
+		if m, ok := tmpfs[path]; ok {
+			for _, value := range []string{fmt.Sprintf("size=%dk", m.kib), fmt.Sprintf("nr_inodes=%d", m.inodes),
+				"uid=1000", "gid=1000", "mode=700", "nosuid", "nodev"} {
 				if !got.check(value) {
 					return fmt.Errorf("%s missing mount option %s", path, value)
 				}
 			}
-			if got.check("noexec") != (path != "/work") {
+			if got.check("noexec") == m.exec {
 				return fmt.Errorf("%s has incorrect execution mode", path)
 			}
 		}
 	}
+	// Docker masks this sysfs subtree when the host exposes it.
+	delete(want, powercapMask)
 	if len(want) != 0 {
 		return fmt.Errorf("missing mounts: %v", want)
 	}
@@ -168,7 +189,7 @@ type liveProfile struct {
 	Devices          map[string]string
 }
 
-func (d engine) checkProfile(c container, spec cdiSpec) error {
+func (d engine) checkProfile(c container, spec cdiSpec, devices []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	data, err := d.fixed(ctx, c.ID, "/stage1", "profile")
@@ -197,7 +218,7 @@ func (d engine) checkProfile(c container, spec cdiSpec) error {
 	}
 	edits := []cdiEdits{spec.ContainerEdits}
 	for _, device := range spec.Devices {
-		if device.Name == "0" {
+		if slices.Contains(devices, device.Name) {
 			edits = append(edits, device.ContainerEdits)
 		}
 	}
@@ -218,7 +239,7 @@ func (d engine) checkProfile(c container, spec cdiSpec) error {
 		return err
 	}
 	for file, want := range map[string]string{
-		"cpu.max": "100000 100000", "memory.max": strconv.Itoa(memoryLimit), "memory.swap.max": "0", "pids.max": strconv.Itoa(pidsLimit),
+		"cpu.max": fmt.Sprintf("%d %d", limits.CPU*CPUPeriod, CPUPeriod), "memory.max": strconv.FormatInt(limits.Memory, 10), "memory.swap.max": "0", "pids.max": strconv.Itoa(limits.PIDs),
 	} {
 		data, err := os.ReadFile(filepath.Join(cgroup(c.ID), file))
 		if err != nil {

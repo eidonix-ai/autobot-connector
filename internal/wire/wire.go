@@ -26,6 +26,7 @@ const (
 	SalvageCap   = 1 << 20
 	BundleCap    = 96 << 20
 	ScratchCap   = 128 << 20
+	MaxScratch   = 16 << 30
 	FileCap      = 7500
 	OperationCap = 32
 	Heartbeat    = 2 * time.Second
@@ -45,6 +46,7 @@ type File struct {
 }
 
 type Manifest struct {
+	GPUs    int      `json:"gpus,omitempty"`
 	Source  *Source  `json:"source,omitempty"`
 	Files   []File   `json:"files,omitempty"`
 	Salvage []string `json:"salvage,omitempty"`
@@ -70,7 +72,7 @@ func ID() string {
 }
 
 func (m Manifest) Valid() bool {
-	if len(m.Files) > 64 || len(m.Salvage) > 16 || (m.Bundle != "" && !Digest(m.Bundle)) {
+	if !ValidGPUCount(m.GPUs) || len(m.Files) > 64 || len(m.Salvage) > 16 || (m.Bundle != "" && !Digest(m.Bundle)) {
 		return false
 	}
 	if m.Source != nil && (!Hex(m.Source.Commit, 20) || len(m.Source.URL) > 2048) {
@@ -115,7 +117,7 @@ func (o Offer) Valid(now time.Time) bool {
 	}
 	return Hex(o.Nonce, 32) && o.Head == head && Digest(o.Image) && o.Manifest.Valid() &&
 		o.ManifestDigest == ManifestDigest(o.Manifest) && o.Deadline.After(now) &&
-		!o.Deadline.After(o.Issued.Add(MaxLease)) && !o.Issued.Before(now.Add(-2*Silence)) && !o.Issued.After(now.Add(Silence)) && o.Scratch > 0 && o.Scratch <= ScratchCap
+		!o.Deadline.After(o.Issued.Add(MaxLease)) && !o.Issued.Before(now.Add(-2*Silence)) && !o.Issued.After(now.Add(Silence)) && o.Scratch > 0 && o.Scratch <= MaxScratch
 }
 
 type Command struct {
@@ -138,19 +140,21 @@ func (c Command) Valid() bool {
 }
 
 type GPU struct {
-	Name         string  `json:"name"`
-	SM           string  `json:"sm"`
-	Temperature  *int    `json:"temperature"`
-	PowerMW      *int    `json:"power_mw"`
-	PowerLimitMW *int    `json:"power_limit_mw"`
-	GraphicsMHz  *int    `json:"graphics_mhz"`
-	MemoryMHz    *int    `json:"memory_mhz"`
-	Throttle     *uint64 `json:"throttle"`
-	Fan          *int    `json:"fan"`
-	ECC          *uint64 `json:"ecc"`
-	XIDCount     *uint64 `json:"xid_count"`
-	LastXID      *uint64 `json:"last_xid"`
-	MemoryMiB    *int    `json:"memory_mib"`
+	UUID          string  `json:"uuid,omitempty"`
+	MemoryUsedMiB *int    `json:"memory_used_mib,omitempty"`
+	Name          string  `json:"name"`
+	SM            string  `json:"sm"`
+	Temperature   *int    `json:"temperature"`
+	PowerMW       *int    `json:"power_mw"`
+	PowerLimitMW  *int    `json:"power_limit_mw"`
+	GraphicsMHz   *int    `json:"graphics_mhz"`
+	MemoryMHz     *int    `json:"memory_mhz"`
+	Throttle      *uint64 `json:"throttle"`
+	Fan           *int    `json:"fan"`
+	ECC           *uint64 `json:"ecc"`
+	XIDCount      *uint64 `json:"xid_count"`
+	LastXID       *uint64 `json:"last_xid"`
+	MemoryMiB     *int    `json:"memory_mib"`
 }
 
 type Health struct {
@@ -162,6 +166,7 @@ type Health struct {
 }
 
 type Status struct {
+	FreeGPUs *int   `json:"free_gpus,omitempty"`
 	Health   Health `json:"health"`
 	Paused   bool   `json:"paused"`
 	Ready    bool   `json:"ready"`
@@ -175,8 +180,9 @@ type Status struct {
 }
 
 type Started struct {
-	Bundle string `json:"bundle"`
-	Health Health `json:"health"`
+	Devices []string `json:"devices,omitempty"`
+	Bundle  string   `json:"bundle"`
+	Health  Health   `json:"health"`
 }
 
 type Chunk struct {
@@ -201,6 +207,7 @@ type Reason struct {
 }
 
 type Facts struct {
+	Devices      []string      `json:"devices,omitempty"`
 	End          string        `json:"end"`
 	RunnerEnd    string        `json:"runner_end,omitempty"`
 	Commands     []CommandFact `json:"commands,omitempty"`

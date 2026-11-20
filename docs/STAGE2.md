@@ -4,7 +4,7 @@ The Compose link connects to the hub over a pinned TLS WebSocket. The hub expose
 administrative API on a local Unix socket. The runner keeps Docker authority and the link
 has read-only access to the runner's socket volume. Only the link has outbound network access.
 
-On the dedicated DGX Spark test machine, use a source copy with the Go archive described in
+On a supported dedicated GPU host, use a source copy with the native Go archive described in
 [Stage 1](STAGE1.md). Populate `module-cache` with the module files from Go's download cache
 for the version pinned in `go.mod`, preserving their paths under `cache/download`. The script
 uses that cache offline. It builds the images natively, starts the test hub with a disposable
@@ -14,8 +14,9 @@ certificate, and removes the test resources when it exits.
 setsid nohup timeout -k 15s 14m bash scripts/run-stage1.sh stage2 >stage2.log 2>&1 </dev/null &
 ```
 
-Watch `progress`. The script runs the full harness through the link, including a host memory
-pressure test and one Docker daemon restart. It writes output to the run log and retains the
+Watch `progress`. The script runs the full acceptance suite through the link and restarts Docker once. The DGX Spark
+run exercises the host memory stop. The discrete GPU run verifies two concurrent leases with
+disjoint GPU sets. It writes output to the run log and retains the
 hub's per-lease records in `lease-audit`. Run the same launcher with `stage2-health` to exercise
 injected readings against live job containers with an injected clock.
 
@@ -35,5 +36,13 @@ volume and a fresh enrollment code.
 
 The GB10 profile requires temperature, power draw, graphics clock and clock event reasons.
 It reports power limit, memory clock, memory capacity, fan, ECC and Xid when available.
-The prototype pins the GPU and work image and accepts a manifest of SHA-256-pinned files
-plus one shallow GitHub checkout pinned by commit.
+The RTX PRO 6000 profile also requires the power limit, memory clock, fan speed, and total and
+used VRAM for each GPU. It reports ECC and Xid when the driver exposes them. Host-memory
+stops and the host-memory recovery floor apply to the GB10. The discrete profile checks assigned
+GPU compute processes and VRAM recovery before device reuse. A signed result's `ready` fact
+records the runner's teardown and recovery checks for that lease, including the host-memory
+floor on GB10. Other leases on discrete cards can continue while those checks run.
+
+The connector pins the native work image and accepts a manifest of SHA-256-pinned files
+plus one shallow GitHub checkout pinned by commit. The manifest can request one to four
+GPUs. Omitting the count requests one GPU.

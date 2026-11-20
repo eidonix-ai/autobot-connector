@@ -16,9 +16,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"autobot-connector/internal/wire"
 )
 
 const controlSocket = "/control/runner.sock"
+const statePath = "/state/lease.json"
 
 var leaseName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
@@ -52,15 +55,20 @@ func (r *runner) api() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /readiness", func(w http.ResponseWriter, req *http.Request) {
 		r.mu.Lock()
-		status := struct{ Status, Active, Last, End string }{Status: "ready"}
+		snapshot := r.snapshot(req.URL.Query().Get("lease"))
+		status := struct {
+			Status, Active, Last, End string
+			FreeGPUs                  int
+			WorkProfile               string
+		}{Status: "ready", FreeGPUs: snapshot.FreeGPUs, WorkProfile: workProfile}
 		if r.dirty || r.reason != "" {
 			status.Status = "unhealthy"
 		}
-		if r.Active != nil {
-			status.Status, status.Active = "running", r.Active.Lease
+		if snapshot.Active != nil {
+			status.Status, status.Active = "running", snapshot.Active.Lease
 		}
-		if r.Last != nil {
-			status.Last, status.End = r.Last.Lease, r.Last.End
+		if snapshot.Last != nil {
+			status.Last, status.End = snapshot.Last.Lease, snapshot.Last.End
 		}
 		r.mu.Unlock()
 		json.NewEncoder(w).Encode(status)
@@ -70,14 +78,14 @@ func (r *runner) api() http.Handler {
 		status := "ready"
 		if r.reason != "" || r.dirty {
 			status = "unhealthy"
-		} else if r.Active != nil {
+		} else if len(r.Leases) > 0 {
 			status = "running"
 		}
 		data, err := json.Marshal(struct {
 			Status string `json:"status"`
 			Reason string `json:"reason,omitempty"`
 			state
-		}{status, r.reason, r.state})
+		}{status, r.reason, r.snapshot(req.URL.Query().Get("lease"))})
 		r.mu.Unlock()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -92,7 +100,7 @@ func (r *runner) api() http.Handler {
 		if !decode(w, req, &in) {
 			return
 		}
-		if !leaseName.MatchString(in.Lease) || !in.Deadline.After(time.Now()) || len(in.Salvage) > 16 {
+		if !leaseName.MatchString(in.Lease) || !in.Deadline.After(time.Now()) || len(in.Salvage) > 16 || !wire.ValidGPUCount(in.GPUs) {
 			http.Error(w, "invalid lease, deadline or salvage list", http.StatusBadRequest)
 			return
 		}
@@ -118,12 +126,13 @@ func (r *runner) api() http.Handler {
 		}
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		if r.Active == nil || r.Active.Lease != in.Lease || (in.End != "cancel" && in.End != "complete") {
+		j := r.activeLease(in.Lease)
+		if j == nil || (in.End != "cancel" && in.End != "complete") {
 			http.Error(w, "invalid stop for active lease", http.StatusConflict)
 			return
 		}
-		if r.Active.End == "" {
-			r.Active.End = in.End
+		if j.End == "" {
+			j.End = in.End
 		}
 		w.WriteHeader(http.StatusAccepted)
 	})
@@ -142,7 +151,7 @@ func (r *runner) command(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	r.mu.Lock()
-	j := r.Active
+	j := r.activeLease(in.Lease)
 	if r.dirty || j == nil || j.Lease != in.Lease || j.End != "" || j.pending != "" || (j.Bundle && !j.loaded) || !time.Now().Before(j.Deadline) {
 		r.mu.Unlock()
 		http.Error(w, "lease cannot accept a command", http.StatusConflict)
@@ -212,16 +221,43 @@ func (r *runner) command(w http.ResponseWriter, req *http.Request) {
 }
 
 func serve() error {
+	if limitsErr != nil {
+		return limitsErr
+	}
 	if !formatSHA(workImage) {
 		return errors.New("invalid work image pin")
 	}
-	r := runner{engine: engine{unixClient("/var/run/docker.sock")}, dirty: true, reason: "reconciling"}
+	names, err := gpuQuery("--query-gpu=name")
+	if err != nil {
+		return fmt.Errorf("GPU model query: %w", err)
+	}
+	if err := checkGPUModel(gpuModel, names); err != nil {
+		return err
+	}
+	r := runner{engine: engine{unixClient("/var/run/docker.sock")}, statePath: statePath, dirty: true, reason: "reconciling"}
+	var saved state
 	if data, err := os.ReadFile(statePath); err == nil {
-		if err = json.Unmarshal(data, &r.state); err != nil {
-			return err
+		if err = json.Unmarshal(data, &saved); err == nil {
+			r.state = saved
+		} else {
+			log.Printf("read runner state: %v", err)
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
+		log.Printf("read runner state: %v", err)
+	}
+	if r.Leases == nil {
+		r.Leases = map[string]*lease{}
+	}
+	if r.Active != nil {
+		r.Leases[r.Active.Lease] = r.Active
+		r.Active = nil
+	}
+	r.vram = map[string]int{}
+	r.usedGPUs = map[string]bool{}
+	r.results = map[string]*lease{}
+	r.cleaned = map[string]bool{}
+	if r.Last != nil {
+		r.results[r.Last.Lease] = r.Last
 	}
 	if err := os.Remove(controlSocket); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err

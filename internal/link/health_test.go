@@ -28,6 +28,37 @@ func goodReading() wire.Health {
 	}}}
 }
 
+func discreteReading() wire.Health {
+	sample := goodReading()
+	g := &sample.GPUs[0]
+	powerLimit, memoryClock, total, used := 300000, 405, 97887, 2
+	g.Name, g.SM, g.UUID = "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", "12.0", "GPU-test"
+	g.PowerLimitMW, g.MemoryMHz = &powerLimit, &memoryClock
+	g.MemoryMiB, g.MemoryUsedMiB = &total, &used
+	return sample
+}
+
+func TestStatusUsesRunnerWorkProfile(t *testing.T) {
+	profile := "flare"
+	l := Link{workProfile: profile, state: localState{sample: goodReading()}}
+	l.state.sample.At = time.Now()
+	l.runner = runner{&http.Client{Transport: transport(func(r *http.Request) (*http.Response, error) {
+		body, err := json.Marshal(map[string]any{"Status": "ready", "WorkProfile": profile, "FreeGPUs": 1})
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}}
+	status := l.status(context.Background())
+	if !status.Ready || status.Memory != 24<<30 || status.Scratch != 16<<30 || status.PIDs != 256 || status.CPUQuota != 400000 {
+		t.Fatalf("limits for the flare runner = %+v", status)
+	}
+	profile = ""
+	if status := l.status(context.Background()); status.Ready || *status.FreeGPUs != 0 {
+		t.Fatalf("advertised capacity after runner profile changed: %+v", status)
+	}
+}
+
 func TestHealthStopsJobsAndRecovers(t *testing.T) {
 	tests := []struct {
 		name, reason string
@@ -43,7 +74,14 @@ func TestHealthStopsJobsAndRecovers(t *testing.T) {
 		{"duty-cycle", "GPU duty cycle", func(*wire.Health) {}, false},
 		{"missing-mandatory-reading", "mandatory GB10 readings unavailable", func(h *wire.Health) { h.GPUs[0].Temperature = nil }, false},
 	}
+	discrete := os.Getenv("DONOR_TEST_GPU_MODEL") == "rtx-pro-6000"
 	for _, tt := range tests {
+		if discrete && tt.name == "host-memory" {
+			continue
+		}
+		if discrete && tt.name == "missing-mandatory-reading" {
+			tt.reason = "mandatory GPU readings unavailable"
+		}
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancelCause(context.Background())
 			defer cancel(nil)
@@ -51,7 +89,7 @@ func TestHealthStopsJobsAndRecovers(t *testing.T) {
 			l := Link{config: Config{State: t.TempDir(), Image: "sha256:" + strings.Repeat("0", 64)}}
 			l.runner = runner{&http.Client{Transport: transport(func(r *http.Request) (*http.Response, error) {
 				if r.URL.Path == "/readiness" {
-					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"Status":"ready"}`))}, nil
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"Status":"ready","WorkProfile":""}`))}, nil
 				}
 				b, _ := io.ReadAll(r.Body)
 				var req struct{ Lease, End string }
@@ -67,10 +105,13 @@ func TestHealthStopsJobsAndRecovers(t *testing.T) {
 			}
 			j := &job{session: session{Link: &l}, id: id, ctx: ctx, cancel: cancel}
 			j.working.Store(true)
-			l.state.job = j
+			l.state.jobs = map[string]*job{id: j}
 			base := time.Now().UTC()
 			feed := func(offset time.Duration, clear bool, modify func(*wire.Health)) {
 				h := goodReading()
+				if discrete {
+					h = discreteReading()
+				}
 				h.At = base.Add(offset)
 				if modify != nil {
 					modify(&h)
@@ -140,6 +181,37 @@ func TestHealthStopsJobsAndRecovers(t *testing.T) {
 				t.Fatalf("not ready after recovery: %+v", status)
 			}
 		})
+	}
+}
+
+func TestDiscreteHostMemoryDoesNotStopJob(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	l := Link{config: Config{State: t.TempDir()}}
+	id := "test-lease"
+	var verify func()
+	if socket := os.Getenv("DONOR_TEST_RUNNER_SOCKET"); socket != "" {
+		if os.Getenv("DONOR_TEST_GPU_MODEL") != "rtx-pro-6000" {
+			t.Skip("requires the discrete GPU profile")
+		}
+		l.runner = newRunner(socket)
+		id, verify = liveHealthJob(t, l.runner)
+	}
+	j := &job{session: session{Link: &l}, id: id, ctx: ctx, cancel: cancel}
+	j.working.Store(true)
+	l.state.jobs = map[string]*job{id: j}
+	sample := discreteReading()
+	sample.At, sample.AvailableKiB = time.Now(), 90
+	l.applySample(sample, false, false)
+	if ctx.Err() != nil || len(l.latest().Reasons) > 0 {
+		t.Fatalf("host memory stopped a discrete GPU job: %v", l.latest().Reasons)
+	}
+	t.Log("9% host memory availability did not stop a discrete GPU job")
+	if verify != nil {
+		if err := l.runner.stop(id, "cancel"); err != nil {
+			t.Fatal(err)
+		}
+		verify()
 	}
 }
 

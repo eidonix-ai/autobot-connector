@@ -1,9 +1,12 @@
 # Stage 1 acceptance run
 
-Run these commands on the DGX Spark test machine from a copy of the source tree. Place the
-official Linux arm64 Go 1.26.5 archive beside `go.mod` as `go.tgz`. The script verifies its
-checksum and builds both images natively from local files. It uses the installed CUDA 13.0
-compiler to build the SM121 kernel. The Go module can be supplied from a local download cache
+Run these commands on a dedicated DGX Spark or a four-card RTX PRO 6000
+Blackwell Max-Q workstation from a copy of the source tree. Put the official
+Linux Go 1.26.5 archive for the machine's architecture beside `go.mod` as
+`go.tgz`. The script verifies its checksum and builds both images natively.
+It compiles the SM121 kernel with the host CUDA compiler on GB10. On a host
+without CUDA installed, set `CUDA_TEST_IMAGE` to a locally available native
+development image with an SM120-capable compiler. The Go module can be supplied from a local download cache
 as described in [Stage 2](STAGE2.md). Images are imported locally and selected by their immutable
 image IDs. [Go release archive](https://go.dev/dl/#go1.26.5)
 
@@ -15,10 +18,20 @@ Watch `progress` and read `stage1.log` for commands and results. The script requ
 Docker daemon, an idle GPU and passwordless sudo for the host checks. It restarts Docker once and
 cleans up the recorded container, image and volume IDs on exit.
 
-The prototype job has one CPU of quota, 512 MiB of memory with zero swap, 48 tasks, and tmpfs
-limits of 128 MiB and 8192 inodes for `/work`, and 8 MiB and 128 inodes each for `/tmp` and `/dev/shm`.
+The runner image fixes the work profile at build time. The acceptance script
+uses the default profile. `scripts/prepare-donor.sh` builds the `flare` profile.
+
+| Per-lease limit | Default | `flare` |
+| --- | --- | --- |
+| CPU quota | 1 CPU | 4 CPUs |
+| Memory | 512 MiB | 24 GiB |
+| Swap | 0 | 0 |
+| Tasks | 48 | 256 |
+| `/work` tmpfs | 128 MiB, 8,192 inodes | 16 GiB, 524,288 inodes |
+| `/tmp` and `/dev/shm` tmpfs, each | 8 MiB, 128 inodes | 8 MiB, 128 inodes |
+
 The runner checks the live mounts, devices, security profiles and cgroup limits before returning
-a lease to the fixture. The local CDI spec pins four CUDA device nodes and five read-only
+a lease to the fixture. The local CDI spec pins the assigned GPU node, three common CUDA nodes, and five read-only
 driver mounts. Docker's named standard system mounts retain their default flags. The trusted
 runner uses the host PID namespace so the GPU query can see host compute PIDs. Jobs use private
 PID namespaces.

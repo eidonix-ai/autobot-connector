@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -36,7 +37,7 @@ type session struct {
 	mu     sync.Mutex
 	closed chan struct{}
 	status wire.Status
-	active *lease
+	active map[string]*lease
 	last   *lease
 }
 
@@ -44,6 +45,7 @@ type lease struct {
 	timer             *time.Timer
 	id                string
 	offer             wire.Offer
+	devices           []string
 	record            *wire.Record
 	audit             *os.File
 	phase             string
@@ -67,7 +69,7 @@ func (s *session) disconnect(reason string) {
 		close(s.closed)
 	}
 	s.conn.Close()
-	if l := s.active; l != nil {
+	for _, l := range s.active {
 		s.terminal(l, Result{Lease: l.id, Error: reason, Facts: wire.Facts{End: "lost", Health: s.status.Health}})
 	}
 }
@@ -145,7 +147,8 @@ func (s *session) terminal(l *lease, r Result) {
 	if l.events != nil {
 		close(l.events)
 	}
-	s.active, s.last = nil, l
+	delete(s.active, l.id)
+	s.last = l
 }
 
 func (s *session) saveResult(r Result) error {
@@ -167,16 +170,17 @@ func (s *session) receive(m wire.Message) error {
 	defer s.mu.Unlock()
 	if m.Type == "heartbeat" && m.Lease == "" {
 		var status wire.Status
-		if m.Decode(&status) != nil || !wire.Digest(status.Image) || len(status.Health.GPUs) > 4 ||
-			status.Scratch <= 0 || status.Scratch > wire.ScratchCap || status.Health.At.IsZero() || status.Health.At.After(s.hub.now().Add(wire.Silence)) {
+		if m.Decode(&status) != nil || !wire.Digest(status.Image) || len(status.Health.GPUs) > wire.MaxGPUs || (status.FreeGPUs != nil &&
+			(*status.FreeGPUs < 0 || *status.FreeGPUs > len(status.Health.GPUs))) ||
+			status.Scratch <= 0 || status.Scratch > wire.MaxScratch || status.Health.At.IsZero() || status.Health.At.After(s.hub.now().Add(wire.Silence)) {
 			return bad
 		}
 		s.status = status
 		s.conn.Extend()
 		return nil
 	}
-	l := s.active
-	if l == nil || m.Lease != l.id {
+	l := s.active[m.Lease]
+	if l == nil {
 		return bad
 	}
 	switch m.Type {
@@ -185,12 +189,13 @@ func (s *session) receive(m wire.Message) error {
 		if l.phase != "offered" || m.Decode(&started) != nil || !wire.Digest(started.Bundle) || started.Health.At.Before(l.offer.Issued.Add(-wire.Silence)) ||
 			started.Health.At.After(s.hub.now().Add(wire.Silence)) ||
 			(l.offer.Manifest.Bundle != "" && started.Bundle != l.offer.Manifest.Bundle) ||
-			len(started.Health.Reasons) != 0 || started.Health.At.IsZero() {
+			len(started.Health.Reasons) != 0 || started.Health.At.IsZero() || !s.validDevices(l, started.Devices) {
 			return bad
 		}
 		if err := l.add(false, m.Type, started); err != nil {
 			return err
 		}
+		l.devices = started.Devices
 		l.phase = "ready"
 		l.start <- nil
 		return nil
@@ -270,32 +275,42 @@ func (s *session) receive(m wire.Message) error {
 	case "done":
 		var done wire.Done
 		if l.phase == "offered" || l.events != nil || m.Decode(&done) != nil ||
-			!l.verify(s.key, s.id, done, s.hub.now()) {
+			!l.verifyTranscript(s.key, s.id, done, s.hub.now()) {
+			return errors.New("transcript refused")
+		}
+		result := Result{Lease: l.id, Verified: true, Facts: done.Facts, Salvage: l.salvage.Bytes()}
+		facts := done.Facts
+		if facts.End == "lost" && !facts.Ready && facts.RunnerEnd == "" && facts.SalvageError != "" &&
+			len(facts.Commands) == 0 && len(result.Salvage) == 0 {
+			// The signature covers this lease's loss, but runner exit evidence is unavailable.
+			result.Verified, result.Error = false, "runner result unavailable"
+		} else if !l.verifyFacts(facts) {
 			return errors.New("transcript refused")
 		}
 		if err := l.add(false, m.Type, done); err != nil {
 			return err
 		}
 
-		s.terminal(l, Result{Lease: l.id, Verified: true, Facts: done.Facts, Salvage: l.salvage.Bytes()})
+		s.terminal(l, result)
 		return nil
 	default:
 		return bad
 	}
 }
 
-func (l *lease) verify(key ed25519.PublicKey, donor string, d wire.Done, now time.Time) bool {
-	if now.After(l.offer.Deadline.Add(30*time.Second)) || d.Facts.Health.At.Before(l.offer.Issued.Add(-wire.Silence)) ||
-		d.Facts.Health.At.After(now.Add(wire.Silence)) || len(d.Facts.Commands) > l.number ||
-		len(l.exits) != l.number || d.Facts.End != l.ending || !l.record.Verify(key, donor, l.id, d) {
-		return false
-	}
-	switch d.Facts.End {
+func (l *lease) verifyTranscript(key ed25519.PublicKey, donor string, d wire.Done, now time.Time) bool {
+	return !now.After(l.offer.Deadline.Add(30*time.Second)) && !d.Facts.Health.At.Before(l.offer.Issued.Add(-wire.Silence)) &&
+		!d.Facts.Health.At.After(now.Add(wire.Silence)) && len(d.Facts.Commands) <= l.number &&
+		len(l.exits) == l.number && slices.Equal(l.devices, d.Facts.Devices) && d.Facts.End == l.ending && l.record.Verify(key, donor, l.id, d)
+}
+
+func (l *lease) verifyFacts(facts wire.Facts) bool {
+	switch facts.End {
 	case "complete":
 		if l.requested != "finish" {
 			return false
 		}
-		if d.Facts.RunnerEnd != "complete" || len(d.Facts.Commands) != l.number {
+		if facts.RunnerEnd != "complete" || len(facts.Commands) != l.number {
 			return false
 		}
 	case "cancel":
@@ -303,7 +318,7 @@ func (l *lease) verify(key ed25519.PublicKey, donor string, d wire.Done, now tim
 			return false
 		}
 	case "health":
-		if len(d.Facts.Health.Reasons) == 0 {
+		if len(facts.Health.Reasons) == 0 {
 			return false
 		}
 	case "deadline", "lost", "output-limit":
@@ -314,10 +329,40 @@ func (l *lease) verify(key ed25519.PublicKey, donor string, d wire.Done, now tim
 		if observed.ExitCode == nil {
 			continue
 		}
-		if i >= len(d.Facts.Commands) || d.Facts.Commands[i].ExitCode == nil ||
-			*d.Facts.Commands[i].ExitCode != *observed.ExitCode {
+		if i >= len(facts.Commands) || facts.Commands[i].ExitCode == nil ||
+			*facts.Commands[i].ExitCode != *observed.ExitCode {
 			return false
 		}
+	}
+	return true
+}
+
+func (s *session) validDevices(l *lease, devices []string) bool {
+	if s.status.FreeGPUs == nil && l.offer.Manifest.GPUs == 0 && len(devices) == 0 {
+		return true
+	}
+	if len(devices) != wire.GPUCount(l.offer.Manifest.GPUs) {
+		return false
+	}
+	known := map[string]bool{}
+	for _, gpu := range s.status.Health.GPUs {
+		if gpu.UUID != "" {
+			known[gpu.UUID] = true
+		}
+	}
+	for _, other := range s.active {
+		if other.ending != "" {
+			continue
+		}
+		for _, device := range other.devices {
+			delete(known, device)
+		}
+	}
+	for _, device := range devices {
+		if !known[device] {
+			return false
+		}
+		delete(known, device)
 	}
 	return true
 }
@@ -331,16 +376,26 @@ func (s *session) begin(manifest wire.Manifest, duration time.Duration, scratch 
 	default:
 	}
 	status := s.status
-	if s.active != nil || !status.Ready || status.Paused || len(status.Health.Reasons) > 0 ||
-		s.hub.now().Sub(status.Health.At) > wire.Silence || status.Image != s.hub.image ||
-		status.Arch != "arm64" || scratch > status.Scratch {
+	image := s.hub.images[status.Arch]
+	total, free := 1, 1
+	if status.FreeGPUs != nil {
+		total, free = len(status.Health.GPUs), *status.FreeGPUs
+	}
+	reserved := 0
+	for _, active := range s.active {
+		reserved += wire.GPUCount(active.offer.Manifest.GPUs)
+	}
+	count := wire.GPUCount(manifest.GPUs)
+	if !status.Ready || status.Paused || len(status.Health.Reasons) > 0 ||
+		s.hub.now().Sub(status.Health.At) > wire.Silence || image == "" || status.Image != image ||
+		count > min(free, total-reserved) || scratch > status.Scratch {
 		return nil, fmt.Errorf("donor unavailable (ready=%t paused=%t health=%q)", status.Ready, status.Paused, status.Health.Reasons)
 	}
 	if duration <= 0 || duration > wire.MaxLease {
 		return nil, errors.New("invalid lease duration")
 	}
 	now := s.hub.now().UTC()
-	o := wire.Offer{Nonce: wire.ID(), Image: s.hub.image, Manifest: manifest, ManifestDigest: wire.ManifestDigest(manifest),
+	o := wire.Offer{Nonce: wire.ID(), Image: image, Manifest: manifest, ManifestDigest: wire.ManifestDigest(manifest),
 		Deadline: now.Add(duration), Issued: now, Scratch: scratch}
 	if manifest.Source != nil {
 		o.Head = manifest.Source.Commit
@@ -354,7 +409,10 @@ func (s *session) begin(manifest wire.Manifest, duration time.Duration, scratch 
 		return nil, err
 	}
 	l := &lease{id: id, offer: o, record: wire.NewRecord(), audit: audit, phase: "offered", start: make(chan error, 1), done: make(chan struct{})}
-	s.active = l
+	if s.active == nil {
+		s.active = map[string]*lease{}
+	}
+	s.active[id] = l
 	if err := l.add(true, "offer", o); err != nil {
 		s.terminal(l, Result{Lease: id, Error: err.Error()})
 		return nil, err
@@ -367,7 +425,7 @@ func (s *session) begin(manifest wire.Manifest, duration time.Duration, scratch 
 	l.timer = time.AfterFunc(duration+30*time.Second, func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if s.active == l {
+		if s.active[id] == l {
 			s.conn.Close()
 		}
 	})
@@ -377,8 +435,8 @@ func (s *session) begin(manifest wire.Manifest, duration time.Duration, scratch 
 func (s *session) command(id string, argv []string) (<-chan Event, *lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	l := s.active
-	if l == nil || l.id != id || l.phase != "ready" || !s.hub.now().Before(l.offer.Deadline) {
+	l := s.active[id]
+	if l == nil || l.phase != "ready" || !s.hub.now().Before(l.offer.Deadline) {
 		return nil, nil, errors.New("lease cannot accept a command")
 	}
 	c := wire.Command{Number: l.number + 1, Argv: argv}
@@ -404,8 +462,8 @@ func (s *session) end(id, op string) (*lease, error) {
 	if s.last != nil && s.last.id == id {
 		return s.last, nil
 	}
-	l := s.active
-	if l == nil || l.id != id || (op == "finish" && l.phase != "ready") ||
+	l := s.active[id]
+	if l == nil || (op == "finish" && l.phase != "ready") ||
 		(op == "cancel" && l.phase != "ready" && l.phase != "executing") {
 		return nil, errors.New("lease cannot accept end operation")
 	}

@@ -34,6 +34,12 @@ type runnerStatus struct {
 	Active, Last *runnerLease
 }
 
+type runnerReadiness struct {
+	Status      string
+	FreeGPUs    *int
+	WorkProfile *string
+}
+
 type runnerEvent struct {
 	Stream string
 	Data   []byte
@@ -90,13 +96,16 @@ func (r runner) json(ctx context.Context, method, path string, input, output any
 	return json.NewDecoder(io.LimitReader(resp.Body, 2*wire.SalvageCap)).Decode(output)
 }
 
-func (r runner) begin(ctx context.Context, id string, offer wire.Offer) error {
-	return r.json(ctx, "POST", "/run", struct {
+func (r runner) begin(ctx context.Context, id string, offer wire.Offer) (struct{ Devices []string }, error) {
+	var allocation struct{ Devices []string }
+	err := r.json(ctx, "POST", "/run", struct {
 		Lease    string
 		Deadline time.Time
 		Salvage  []string
 		Bundle   bool
-	}{id, offer.Deadline, offer.Manifest.Salvage, true}, nil)
+		GPUs     int
+	}{id, offer.Deadline, offer.Manifest.Salvage, true, offer.Manifest.GPUs}, &allocation)
+	return allocation, err
 }
 
 func (r runner) load(ctx context.Context, id string, b *inputs.Bundle) error {
@@ -114,16 +123,16 @@ func (r runner) stop(id, reason string) error {
 	return r.json(ctx, "POST", "/stop", struct{ Lease, End string }{id, reason}, nil)
 }
 
-func (r runner) end(id, reason string, until time.Time) (runnerStatus, error) {
-	var s runnerStatus
+func (r runner) end(id, reason string, until time.Time) (*runnerLease, error) {
 	var err error
 	for time.Now().Before(until) {
+		var s runnerStatus
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		err = r.json(ctx, "GET", "/status", nil, &s)
+		err = r.json(ctx, "GET", "/status?lease="+id, nil, &s)
 		cancel()
 		if err == nil {
 			if s.Last != nil && s.Last.Lease == id {
-				return s, nil
+				return s.Last, nil
 			}
 			if s.Active != nil && s.Active.Lease == id {
 				r.stop(id, reason)
@@ -131,5 +140,5 @@ func (r runner) end(id, reason string, until time.Time) (runnerStatus, error) {
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
-	return runnerStatus{}, errors.Join(errors.New("runner result unavailable"), err)
+	return nil, errors.Join(errors.New("runner result unavailable"), err)
 }

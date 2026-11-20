@@ -168,9 +168,7 @@ func (h *Hub) operate(w http.ResponseWriter, r *http.Request) error {
 		var l *lease
 		if op == "result" {
 			s.mu.Lock()
-			if s.active != nil && s.active.id == q.Lease {
-				l = s.active
-			}
+			l = s.active[q.Lease]
 			if s.last != nil && s.last.id == q.Lease {
 				l = s.last
 			}

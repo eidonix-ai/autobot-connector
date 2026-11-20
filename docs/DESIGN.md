@@ -2,8 +2,8 @@
 
 People lend idle GPU machines so Flare's changes get tested on hardware we do not have: other GPU
 architectures, more GPUs, other interconnects. A testing agent on our side drives each job. The
-donor's own coding agent sets the machine up from a brief. This file is the contract (2026-11-20;
-fourth version, after three design reviews).
+donor's own coding agent sets the machine up from a brief. This file specifies the connector and the planned donor setup. See
+[Flare test donors](STAGE3.md) for the deployment and its limits.
 
 ## 1. Principles
 
@@ -46,11 +46,11 @@ tells the agent to:
    | Hours jobs may run | any time |
 
 4. Fetch the release at the brief's tag, check the compose file's SHA-256 against the brief, and write
-   `~/.flare-donor/compose.yml` and `limits.env`, changing only the documented fields. Never add
+   `compose.yml` and `limits.env` in the chosen installation directory, changing only the documented fields. Never add
    privileges, devices, mounts, network settings or capabilities.
 5. Enroll with the code the donor pastes from Discord (`/donate`), without echoing it to history or
-   logs; start; run the self-check; show the result and the commands (`docker compose -f
-   ~/.flare-donor/compose.yml stop|start|logs`, update, and uninstall with `down -v`, removing the
+   logs; start; run the self-check; show the result and the commands (`docker compose stop|start|logs`
+   from the installation directory, update, and uninstall with `down -v`, removing the
    folder and images, and `/donate revoke`).
 
 Shared models come later (section 9).
@@ -121,9 +121,9 @@ profile check.
   | Throttling | thermal or hardware slowdown | none for 5 minutes |
   | Fan (where reported) | zero while the GPU is above 60 °C | the donor clears it |
   | ECC or Xid error | any new one | the donor clears it |
-  | Host memory | available under 10% | above 20% for 5 minutes |
+  | Host memory on unified-memory GPUs | available under 10% | above 20% for 5 minutes |
 
-  Any trigger stops the running job through the runner, marks the machine `cooling` or `unhealthy`,
+  Any trigger stops the running jobs through the runner, marks the machine `cooling` or `unhealthy`,
   and refuses leases until recovery. When several trigger, the machine recovers only when all have.
 - Duty cycle: at most 2 hours of GPU work at a stretch, then 15 minutes' rest.
 
@@ -138,11 +138,11 @@ profile check.
    fixed public list; a missing lock, an unsupported source or a missing hash refuses the job. Bulk
    bytes never pass through our hub.
 2. **Match**: only to a machine whose hardware, limits and health fit.
-3. **Lease**: nonce, lease id, head, image and bundle digests, deadline, scratch need, salvage paths.
+3. **Lease**: nonce, lease id, head, image and bundle digests, deadline, GPU count, scratch need, salvage paths.
 4. **Run**: the link fetches and verifies the manifest's files; the runner creates the container and
    streams them in through the loader; the testing agent drives the job.
 5. **End**: the runner stops every process, salvages, records the exit facts, destroys the container,
-   checks teardown, and reports; the link sends `done` with the signed transcript.
+   checks teardown, and reports; the link sends `done` with the signed transcript and assigned GPU UUIDs.
 
 ## 6. Logs and crashed jobs
 
@@ -219,4 +219,4 @@ then SETUP.md tried by a fresh agent on a clean machine.
 - **Disk scratch** larger than RAM allows, once a hard-limited disk option is proven on the
   supported stack.
 - **Telemetry** from host paths under `/sys`, each named here before it is mounted.
-- Per-GPU selection on a multi-GPU machine, amd64 images, and a VM boundary for donors who want it.
+- A VM boundary for donors who want it.

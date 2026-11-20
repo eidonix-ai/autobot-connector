@@ -196,6 +196,7 @@ def negative_inputs():
 
 def cuda():
     mark("4 real CUDA memory floor")
+    assert not run(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"]).stdout.strip()
     lease = begin("cuda-floor", "3m")
     container = lease_container(lease)
     assert container
@@ -247,6 +248,43 @@ def cuda():
     print(f"PASS host memory recovery: ready {elapsed:.3f}s after release", flush=True)
 
 
+def gpu_partition():
+    mark("4 overlapping leases with exact GPU assignments")
+    assert not run(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"]).stdout.strip()
+    two = Path(BUILD) / "two.json"
+    two.write_text('{"gpus":2}\n')
+    go = [str(Path(BUILD) / "driver"), os.environ["HUB_SOCKET"], DONOR]
+    first = run(go + ["begin", str(two), "2m"]).stdout.strip()
+    second = run(go + ["begin", str(two), "2m"]).stdout.strip()
+    assignments = []
+    for lease in [first, second]:
+        container = lease_container(lease)
+        assert container
+        data = json.loads(run(["docker", "inspect", container], quiet=True).stdout)[0]
+        devices = data["HostConfig"]["DeviceRequests"][0]["DeviceIDs"]
+        assert len(devices) == 2 and all(d.startswith("flare.local/gpu=GPU-") for d in devices)
+        assignments.append({d.removeprefix("flare.local/gpu=") for d in devices})
+        result = run(command(lease, "/cuda", "--devices"))
+        assert set(result.stdout.splitlines()) == assignments[-1]
+    assert not assignments[0] & assignments[1]
+    p = run(HUB + ["run", DONOR, EMPTY, "--", "/bin/sh", "-c", "exit 1"], expected=1)
+    assert "donor unavailable" in p.stderr
+    work = [child(command(lease, "/cuda")) for lease in (first, second)]
+    for p in work:
+        line = p.stdout.readline().strip()
+        print(line, flush=True)
+        assert line.startswith("SM120 uid=1000 ")
+    rows = run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"])
+    active = {r.split(",")[0] for r in rows.stdout.splitlines()}
+    assert len(active) == 2 and all(len(active & ids) == 1 for ids in assignments)
+    for index, lease in enumerate([first, second]):
+        result = json.loads(run(go + ["stop", lease]).stdout)
+        assert result["verified"] and result["facts"]["end"] == "cancel"
+        assert set(result["facts"]["devices"]) == assignments[index]
+    poll(lambda: ready(donor()), 15, "ready after partition tests")
+    print(f"PASS two concurrent two-GPU leases: {sorted(assignments[0])}, {sorted(assignments[1])}")
+
+
 def revoke():
     mark("1 revocation during a live lease")
     lease = begin("revoke")
@@ -280,7 +318,10 @@ try:
         negative_inputs()
         pause()
         heartbeat()
-        cuda()
+        if os.uname().machine == "aarch64":
+            cuda()
+        else:
+            gpu_partition()
 finally:
     for p in children:
         stop(p)

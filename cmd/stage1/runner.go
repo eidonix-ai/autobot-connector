@@ -6,20 +6,24 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"autobot-connector/internal/wire"
 )
 
-const statePath = "/state/lease.json"
+const hostMemoryAllowanceKiB = 976562
 
-var workImage, cdiDigest string // Set when the local images are built.
+var workImage, cdiDigest, workProfile string // Set when the local images are built.
 
 type leaseRequest struct {
+	GPUs     int       `json:"gpus,omitempty"`
 	Lease    string    `json:"lease"`
 	Deadline time.Time `json:"deadline"`
 	Salvage  []string  `json:"salvage,omitempty"`
@@ -32,6 +36,7 @@ type commandFact struct {
 
 type lease struct {
 	leaseRequest
+	Devices         []string      `json:"devices,omitempty"`
 	Container       string        `json:"container"`
 	End             string        `json:"end,omitempty"`
 	Commands        []commandFact `json:"commands,omitempty"`
@@ -43,12 +48,15 @@ type lease struct {
 	SalvageError    string        `json:"salvage_error,omitempty"`
 	pending         string
 	loading, loaded bool
+	removed         bool
 }
 
 type state struct {
-	Active   *lease `json:"active,omitempty"`
-	Last     *lease `json:"last,omitempty"`
-	Baseline int64  `json:"baseline_kib"`
+	Leases   map[string]*lease `json:"leases,omitempty"`
+	FreeGPUs int               `json:"free_gpus,omitempty"`
+	Active   *lease            `json:"active,omitempty"`
+	Last     *lease            `json:"last,omitempty"`
+	Baseline int64             `json:"baseline_kib"`
 	removed  []string
 }
 
@@ -56,9 +64,14 @@ type runner struct {
 	mu sync.Mutex
 	engine
 	state
-	dirty          bool
-	reason         string
-	profileFailure string
+	statePath string
+	dirty     bool
+	reason    string
+	results   map[string]*lease
+	cleaned   map[string]bool
+	vram      map[string]int
+	usedGPUs  map[string]bool
+	free      int
 }
 
 func cgroup(id string) string {
@@ -81,30 +94,22 @@ func readCounter(path, key string) (int64, error) {
 
 func available() (int64, error) { return readCounter("/proc/meminfo", "MemAvailable:") }
 
-func gpuIdle() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "/usr/bin/nvidia-smi", "--query-compute-apps=pid", "--format=csv").Output()
-	if err != nil {
-		return fmt.Errorf("GPU process query: %w", err)
-	}
-	if strings.TrimSpace(string(out)) != "pid" {
-		return fmt.Errorf("GPU has compute processes: %q", out)
-	}
-	return nil
-}
-
 func formatSHA(s string) bool {
 	hex, ok := strings.CutPrefix(s, "sha256:")
 	return ok && len(hex) == 64 && strings.Trim(hex, "0123456789abcdef") == ""
 }
 
-func (r *runner) save() error {
+func (r *runner) save() (err error) {
+	defer func() {
+		if err != nil {
+			r.dirty, r.reason, r.free = true, err.Error(), 0
+		}
+	}()
 	b, err := json.Marshal(r.state)
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(statePath+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(r.statePath+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
@@ -113,23 +118,14 @@ func (r *runner) save() error {
 	if err != nil {
 		return err
 	}
-	if err = os.Rename(statePath+".tmp", statePath); err != nil {
+	if err = os.Rename(r.statePath+".tmp", r.statePath); err != nil {
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(statePath))
+	dir, err := os.Open(filepath.Dir(r.statePath))
 	if err != nil {
 		return err
 	}
 	return errors.Join(dir.Sync(), dir.Close())
-}
-
-func (r *runner) lose(leaseID, id string) {
-	if r.Active == nil {
-		r.Active = &lease{leaseRequest: leaseRequest{Lease: leaseID}, Container: id}
-	}
-	if id != "" {
-		r.removed = append(r.removed, id)
-	}
 }
 
 func (r *runner) reconcile() error {
@@ -151,17 +147,20 @@ func (r *runner) reconcile() error {
 		r.removed = append(r.removed, r.Last.Container)
 	}
 	for _, c := range list {
-		r.lose(c.Labels[leaseLabel], c.ID)
+		id := c.Labels[leaseLabel]
+		if r.Leases[id] == nil {
+			r.Leases[id] = &lease{leaseRequest: leaseRequest{Lease: id}, Container: c.ID}
+		}
 		if err := r.remove(c.ID); err != nil {
 			return err
 		}
+		r.removed = append(r.removed, c.ID)
 	}
-	if j := r.Active; j != nil {
+	for _, j := range r.Leases {
 		if j.Container != "" {
 			r.removed = append(r.removed, j.Container)
 		}
-		r.Last = &lease{leaseRequest: j.leaseRequest, Container: j.Container, End: "lost"}
-		r.Active = nil
+		r.complete(&lease{leaseRequest: j.leaseRequest, Devices: j.Devices, Container: j.Container, End: "lost"})
 	}
 	if err := r.save(); err != nil {
 		return err
@@ -170,111 +169,187 @@ func (r *runner) reconcile() error {
 	return nil
 }
 
-func (r *runner) ready() error {
+func (r *runner) capacity() ([]string, error) {
 	list, err := r.labelled()
 	if err != nil {
 		r.dirty = true
-		return err
+		return nil, err
 	}
-	if len(list) > 0 {
-		return fmt.Errorf("leftover labelled container %s", list[0].ID)
+	for _, c := range list {
+		j := r.Leases[c.Labels[leaseLabel]]
+		if j == nil || (j.Container != c.ID && !(j.Container == "" && j.End == "lost")) {
+			return nil, fmt.Errorf("leftover labelled container %s", c.ID)
+		}
 	}
 	for _, id := range r.removed {
 		if _, err := os.Stat(cgroup(id)); !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("job cgroup %s still present or unverifiable: %v", id, err)
+			return nil, fmt.Errorf("job cgroup %s still present or unverifiable: %v", id, err)
 		}
 	}
 	r.removed = nil
-	if r.profileFailure != "" {
-		return errors.New(r.profileFailure)
-	}
 	var image struct {
 		ID, Architecture string
 		Config           struct{ Volumes map[string]any }
 	}
 	err = r.call("GET", "/images/"+workImage+"/json", nil, &image)
-	if err != nil || image.ID != workImage || image.Architecture != "arm64" || len(image.Config.Volumes) != 0 {
-		return errors.New("pinned arm64 work image unavailable or declares volumes")
+	if err != nil || image.ID != workImage || image.Architecture != runtime.GOARCH || len(image.Config.Volumes) != 0 {
+		return nil, fmt.Errorf("pinned %s work image unavailable or declares volumes", runtime.GOARCH)
 	}
-	if _, err := readCDI(cdiDigest); err != nil {
-		return err
-	}
-	if err = gpuIdle(); err != nil {
-		return err
-	}
-	mem, err := available()
+	spec, err := readCDI(cdiDigest)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if mem < r.Baseline-976562 {
-		return fmt.Errorf("MemAvailable %d KiB below recovery floor %d KiB", mem, r.Baseline-976562)
+	busy, memory, err := gpuUsage()
+	if err != nil {
+		return nil, err
+	}
+	reserved := map[string]bool{}
+	for _, j := range r.Leases {
+		for _, id := range j.Devices {
+			reserved[id] = true
+		}
+	}
+	r.updateVRAM(busy, memory)
+	free, err := spec.freeGPUs(reserved, busy, memory, r.vram)
+	if err != nil {
+		return nil, err
+	}
+	if len(free) == 0 && len(r.Leases) == 0 {
+		return nil, errors.New("no idle GPU within its memory recovery limit")
+	}
+	if len(free) > 0 {
+		if err := r.verifyRecovery(free, available); err != nil {
+			return nil, err
+		}
+	}
+	return free, nil
+}
+
+func (r *runner) verifyRecovery(free []string, hostMemory func() (int64, error)) error {
+	if gpuModel == "gb10" {
+		mem, err := hostMemory()
+		if err != nil {
+			return err
+		}
+		floor := r.Baseline - hostMemoryAllowanceKiB
+		if mem < floor {
+			return fmt.Errorf("MemAvailable %d KiB below recovery floor %d KiB", mem, floor)
+		}
+	}
+	available := map[string]bool{}
+	for _, device := range free {
+		available[device] = true
+	}
+	for id, j := range r.results {
+		released := true
+		for _, device := range j.Devices {
+			released = released && available[device]
+		}
+		if released {
+			r.cleaned[id] = true
+		}
 	}
 	return nil
+}
+
+func (r *runner) complete(j *lease) {
+	delete(r.Leases, j.Lease)
+	r.Last = j
+	r.results[j.Lease] = j
+	r.pruneResults()
 }
 
 // The runner owns this loop and all end transitions, independent of client streams.
 func (r *runner) tick() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.free = 0
 	if r.dirty {
 		if err := r.reconcile(); err != nil {
 			r.reason = err.Error()
 			return
 		}
 	}
-	if j := r.Active; j != nil {
-		info, err := r.inspect(j.Container)
-		if err != nil || !info.State.Running {
-			r.dirty = true
-			r.reason = "Docker or job keeper became unavailable"
-			return
+	for _, j := range r.Leases {
+		if !j.removed && j.End != "lost" {
+			switch info, err := r.inspect(j.Container); {
+			case err != nil || !info.State.Running:
+				j.End = "lost"
+			case j.End == "" && time.Now().Before(j.Deadline):
+				continue
+			default:
+				if j.End == "" {
+					j.End = "deadline"
+				}
+				if err := r.finish(j, info); err != nil {
+					log.Printf("finish lease %s: %v", j.Lease, err)
+					j.End = "lost"
+				}
+			}
 		}
-		if !time.Now().Before(j.Deadline) && j.End == "" {
-			j.End = "deadline"
+		if err := r.retire(j); err != nil {
+			log.Printf("retire lease %s: %v", j.Lease, err)
 		}
-		if j.End == "" {
-			return
-		}
-		r.reason = "verifying teardown"
-		if err := r.finish(j); err != nil {
-			r.reason = err.Error()
+		if r.dirty {
 			return
 		}
 	}
 	r.reason = ""
-	if err := r.ready(); err != nil {
+	free, err := r.capacity()
+	if err != nil {
 		r.reason = err.Error()
 	}
+	r.free = len(free)
 }
 
 func (r *runner) start(in leaseRequest) (*lease, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.Active != nil {
-		return nil, errors.New("lease still active")
+	if r.Leases[in.Lease] != nil {
+		return nil, errors.New("lease already active")
 	}
 	if r.dirty {
 		return nil, fmt.Errorf("unhealthy: %s", r.reason)
 	}
-	if err := r.ready(); err != nil {
-		r.reason = err.Error()
+	free, err := r.capacity()
+	if err != nil {
+		r.free, r.reason = 0, err.Error()
 		return nil, fmt.Errorf("unhealthy: %w", err)
+	}
+	count := wire.GPUCount(in.GPUs)
+	if count > len(free) {
+		return nil, fmt.Errorf("%d GPUs requested, %d available", count, len(free))
 	}
 	spec, err := readCDI(cdiDigest)
 	if err != nil {
 		return nil, err
 	}
-	r.Baseline, err = available()
-	if err != nil {
-		return nil, err
+	if gpuModel == "gb10" {
+		r.Baseline, err = available()
+		if err != nil {
+			return nil, err
+		}
 	}
-	j := &lease{leaseRequest: in}
-	r.Active = j
+	j, err := r.startLease(in, spec, free[:count])
+	r.free = len(free) - count
+	if r.dirty {
+		r.free = 0
+	}
+	return j, err
+}
+
+func (r *runner) startLease(in leaseRequest, spec cdiSpec, devices []string) (*lease, error) {
+	j := &lease{leaseRequest: in, Devices: devices}
+	r.Leases[in.Lease] = j
 	if err := r.save(); err != nil {
-		r.Active = nil
+		delete(r.Leases, in.Lease)
 		return nil, err
 	}
-	j.Container, err = r.create(workImage, in.Lease)
+	for _, device := range devices {
+		r.usedGPUs[device] = true
+	}
+	var err error
+	j.Container, err = r.create(workImage, in.Lease, j.Devices)
 	if err == nil {
 		err = r.call("POST", "/containers/"+j.Container+"/start", nil, nil)
 	}
@@ -282,10 +357,7 @@ func (r *runner) start(in leaseRequest) (*lease, error) {
 		var c container
 		c, err = r.inspect(j.Container)
 		if err == nil {
-			err = r.checkProfile(c, spec)
-			if err != nil {
-				r.profileFailure = "job profile: " + err.Error()
-			}
+			err = r.checkProfile(c, spec, j.Devices)
 		}
 	}
 	if err == nil {
@@ -297,25 +369,55 @@ func (r *runner) start(in leaseRequest) (*lease, error) {
 		err = r.save()
 	}
 	if err != nil {
-		r.dirty, r.reason = true, err.Error()
-		return nil, err
+		j.End = "lost"
+		return nil, errors.Join(err, r.retire(j))
 	}
 	copy := *j
 	return &copy, nil
 }
 
-func (r *runner) finish(j *lease) error {
-	c, err := r.inspect(j.Container)
-	if err != nil {
-		r.dirty = true
-		return err
+func (r *runner) retire(j *lease) error {
+	if !j.removed {
+		// Docker can create a container even if its reply never reaches the runner.
+		if j.Container == "" {
+			list, err := r.labelled()
+			if err != nil {
+				r.dirty, r.reason = true, err.Error()
+				return err
+			}
+			for _, c := range list {
+				if c.Labels[leaseLabel] == j.Lease {
+					j.Container = c.ID
+					break
+				}
+			}
+		}
+		if j.Container != "" {
+			if err := r.remove(j.Container); err != nil {
+				j.End = "lost"
+				return err
+			}
+		}
+		j.removed = true
 	}
+	if j.Container != "" {
+		_, err := os.Stat(cgroup(j.Container))
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	r.complete(j)
+	return r.save()
+}
+
+func (r *runner) finish(j *lease, c container) error {
 	path := cgroup(j.Container)
 	salvageSafe := r.onlyKeeper(c)
 	if !salvageSafe {
-		err = r.call("POST", "/containers/"+j.Container+"/kill?signal=SIGUSR1", nil, nil)
-		if err != nil {
-			r.dirty = true
+		if err := r.call("POST", "/containers/"+j.Container+"/kill?signal=SIGUSR1", nil, nil); err != nil {
 			return err
 		}
 		for until := time.Now().Add(2 * time.Second); time.Now().Before(until); time.Sleep(25 * time.Millisecond) {
@@ -347,8 +449,9 @@ func (r *runner) finish(j *lease) error {
 	if len(j.Salvage) > 0 {
 		if salvageSafe {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			j.SalvageTar, err = r.fixed(ctx, j.Container, append([]string{"/stage1", "export"}, j.Salvage...)...)
+			data, err := r.fixed(ctx, j.Container, append([]string{"/stage1", "export"}, j.Salvage...)...)
 			cancel()
+			j.SalvageTar = data
 			if err != nil {
 				j.SalvageError = err.Error()
 			}
@@ -356,17 +459,10 @@ func (r *runner) finish(j *lease) error {
 			j.SalvageError = "workload did not quiesce before removal"
 		}
 	}
-	c, err = r.inspect(j.Container)
-	if err == nil {
+	if c, err := r.inspect(j.Container); err == nil {
 		j.OOMKilled = &c.State.OOMKilled
 	}
-	if err = r.remove(j.Container); err != nil {
-		r.dirty = true
-		return err
-	}
-	r.removed = append(r.removed, j.Container)
-	r.Last, r.Active = j, nil
-	return r.save()
+	return nil
 }
 
 func (d engine) onlyKeeper(c container) bool {

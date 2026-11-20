@@ -28,7 +28,7 @@ func (r *runner) load(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	r.mu.Lock()
-	j := r.Active
+	j := r.activeLease(id)
 	if r.dirty || j == nil || j.Lease != id || j.End != "" || !j.Bundle || j.loading || j.loaded {
 		r.mu.Unlock()
 		http.Error(w, "lease cannot accept inputs", http.StatusConflict)

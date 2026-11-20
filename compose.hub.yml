@@ -1,0 +1,26 @@
+name: flare-donor-hub
+services:
+  hub:
+    image: ${HUB_IMAGE:?build the local image first}
+    pull_policy: never
+    command: ["/hub", "serve", "${HUB_LISTEN:?set the donor listener}", "/hub-state/tls.pem",
+              "/hub-state/tls.key", "/hub-state/state", "${HUB_WORK_IMAGES:?pin the native work images}"]
+    environment:
+      HUB_SOCKET: /hub-state/hub.sock
+    restart: unless-stopped
+    network_mode: host
+    user: "${HUB_UID:?set the owner UID}:${HUB_GID:?set the owner GID}"
+    read_only: true
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    cpus: 1
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 64
+    volumes:
+      - ${HUB_DIRECTORY:?set the state directory}:/hub-state
+    logging:
+      driver: local
+      options:
+        max-size: 1m
+        max-file: "2"

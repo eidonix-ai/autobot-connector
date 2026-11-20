@@ -20,7 +20,7 @@ const state = "/link-state"
 
 func run() error {
 	if len(os.Args) != 2 {
-		return errors.New("usage: link run|enroll|pause|resume|clear")
+		return errors.New("usage: link run|enroll|pause|resume|clear|reset-enrollment")
 	}
 	switch os.Args[1] {
 	case "run":
@@ -52,6 +52,13 @@ func run() error {
 			return err
 		}
 		return os.Rename(p+".tmp", p)
+	case "reset-enrollment":
+		for _, name := range []string{"key", "code", "last-offer"} {
+			if err := os.Remove(filepath.Join(state, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		return nil
 	case "pause", "clear":
 		return os.WriteFile(filepath.Join(state, os.Args[1]), nil, 0600)
 	case "resume":

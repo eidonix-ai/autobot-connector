@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -22,6 +21,7 @@ type job struct {
 	session
 	id                     string
 	offer                  wire.Offer
+	devices                []string
 	ctx                    context.Context
 	deadlineCancel         context.CancelFunc
 	cancel                 context.CancelCauseFunc
@@ -52,7 +52,18 @@ func (s session) offer(id string, o wire.Offer) error {
 	j := &job{session: s, id: id, offer: o, ctx: ctx, deadlineCancel: deadlineCancel, cancel: cancel,
 		record: wire.NewRecord(), phase: "preparing", commands: make(chan wire.Command, 1), finished: make(chan struct{}), sealed: make(chan struct{})}
 	j.record.Add(true, "offer", o)
-	s.state.job = j
+	if s.state.jobs == nil {
+		s.state.jobs = map[string]*job{}
+	}
+	reserved := 0
+	for _, active := range s.state.jobs {
+		reserved += wire.GPUCount(active.offer.Manifest.GPUs)
+	}
+	if reserved+wire.GPUCount(o.Manifest.GPUs) > len(sample.GPUs) {
+		s.state.mu.Unlock()
+		return s.conn.Send("refused", id, wire.Reason{Reason: "insufficient GPUs"})
+	}
+	s.state.jobs[id] = j
 	s.state.mu.Unlock()
 	go j.work()
 	return nil
@@ -177,8 +188,8 @@ func (j *job) receive(m wire.Message) bool {
 func (j *job) release() {
 	j.working.Store(false)
 	j.state.mu.Lock()
-	if j.state.job == j {
-		j.state.job = nil
+	if j.state.jobs[j.id] == j {
+		delete(j.state.jobs, j.id)
 	}
 	j.state.mu.Unlock()
 }
@@ -210,7 +221,7 @@ func (j *job) work() {
 		j.mu.Unlock()
 		return
 	}
-	err = j.send("started", wire.Started{Bundle: b, Health: sample})
+	err = j.send("started", wire.Started{Bundle: b, Health: sample, Devices: j.devices})
 	j.phase = "ready"
 	j.mu.Unlock()
 	if err == nil {
@@ -233,19 +244,20 @@ func (j *job) prepare() (string, error) {
 	// A /run request must settle before cancellation can be treated as proof that
 	// no container was created.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err = j.runner.begin(ctx, j.id, j.offer)
+	allocation, err := j.runner.begin(ctx, j.id, j.offer)
 	timedOut := ctx.Err() != nil
 	cancel()
 	if err != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		var status struct{ Active string }
-		statusErr := j.runner.json(ctx, "GET", "/readiness", nil, &status)
+		statusErr := j.runner.json(ctx, "GET", "/readiness?lease="+j.id, nil, &status)
 		cancel()
 		if timedOut || statusErr != nil || status.Active == j.id {
 			j.runner.end(j.id, "cancel", time.Now().Add(12*time.Second))
 		}
 		return "", err
 	}
+	j.devices = allocation.Devices
 	j.working.Store(true)
 	j.mu.Lock()
 	j.stopLocked()
@@ -269,7 +281,7 @@ func (j *job) execute() {
 		case <-tick.C:
 			ctx, cancel := context.WithTimeout(j.ctx, time.Second)
 			var status struct{ Active, Last, End string }
-			err := j.runner.json(ctx, "GET", "/readiness", nil, &status)
+			err := j.runner.json(ctx, "GET", "/readiness?lease="+j.id, nil, &status)
 			cancel()
 			if err == nil && status.Active != j.id && j.ctx.Err() == nil {
 				reason := "lost"
@@ -348,11 +360,16 @@ func (j *job) finalize() {
 		reason = "lost"
 	}
 	j.phase = "closing"
-	announced := j.send("ending", wire.Reason{Reason: reason}) == nil
 	j.stopLocked()
 	j.mu.Unlock()
-	state, err := j.runner.end(j.id, runnerEnd(reason), time.Now().Add(15*time.Second))
+	last, err := j.runner.end(j.id, runnerEnd(reason), time.Now().Add(15*time.Second))
 	j.working.Store(false)
+	j.mu.Lock()
+	if last == nil || last.End == "lost" || (reason == "complete" && last.End != "complete") {
+		reason = "lost"
+	}
+	announced := j.send("ending", wire.Reason{Reason: reason}) == nil
+	j.mu.Unlock()
 	if !announced {
 		return
 	}
@@ -367,11 +384,10 @@ func (j *job) finalize() {
 	if j.trigger.At.IsZero() {
 		j.trigger = j.latest()
 	}
-	facts := wire.Facts{End: reason, Health: j.trigger, Ready: state.Status == "ready"}
+	facts := wire.Facts{End: reason, Health: j.trigger, Ready: last != nil, Devices: j.devices}
 	if err != nil {
 		facts.SalvageError = trim(err.Error())
 	} else {
-		last := state.Last
 		facts.RunnerEnd, facts.Commands = last.End, last.Commands
 		facts.OOMBefore, facts.OOMAfter, facts.OOMKilled = last.OOMBefore, last.OOMAfter, last.OOMKilled
 		facts.SalvageError = trim(last.SalvageError)
@@ -382,10 +398,6 @@ func (j *job) finalize() {
 			}
 			data = data[n:]
 		}
-	}
-	if facts.End == "complete" && facts.RunnerEnd != "complete" {
-		// The hub will reject a completion whose evidence is incomplete.
-		log.Printf("runner completion unavailable for lease %s", j.id)
 	}
 	done := j.record.Sign(j.key, j.donor, j.id, facts)
 	j.phase = "finished"
